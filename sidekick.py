@@ -46,6 +46,8 @@ Platform: macOS (zsh available via the bash tool).
 
 Use the tools to inspect and change code. Rules:
 - Read a file before editing it. Keep edits minimal and targeted.
+- You already have what you've read — don't re-read a file that hasn't changed; scroll up.
+- Diagnose the root cause before editing. Don't stack speculative fixes hoping one sticks.
 - Prefer edit_file for small changes; use multi_edit to change several spots in one file at once;
   write_file only for new files or full rewrites.
 - Use bash for everything else: ls, grep, find, git, running code and tests.
@@ -100,14 +102,35 @@ TOOLS = [
 ]
 
 
+# ponytail: re-read guard. A local model tends to re-read the same file over and over,
+# bloating context and spinning. Return a stub for an unchanged re-read; cleared on trim
+# (so a read evicted from context can be fetched again) and on /new.
+_READ_SEEN = {}  # realpath -> {"sig": (mtime_ns, size), "offsets": set()}
+
+
 def tool_read_file(path, offset=1, **_):
+    off = int(offset)
+    rp = os.path.realpath(path)
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = None
+    seen = _READ_SEEN.get(rp)
+    if seen and seen["sig"] == sig and off in seen["offsets"]:
+        return (f"[already read {path} (from line {off}) earlier in this conversation and it "
+                "hasn't changed since — reuse that read instead of reading it again]")
     with open(path, errors="replace") as f:
         lines = f.readlines()
-    start = max(int(offset) - 1, 0)
+    start = max(off - 1, 0)
     chunk = lines[start:start + 400]
     body = "".join(f"{start + i + 1}\t{l}" for i, l in enumerate(chunk))
     if start + 400 < len(lines):
         body += f"\n[truncated: file has {len(lines)} lines, use offset to read more]"
+    if seen and seen["sig"] == sig:
+        seen["offsets"].add(off)
+    else:
+        _READ_SEEN[rp] = {"sig": sig, "offsets": {off}}
     return body or "[empty file]"
 
 
@@ -310,29 +333,53 @@ def trim(messages):
             del messages[2]
             dropped += 1
     if dropped:
+        _READ_SEEN.clear()  # a dropped read is no longer in context — allow re-reading it
         print(f"{DIM}⋯ context full — dropped {dropped} old message(s) to stay under "
               f"{CTX_CHARS // 3 // 1000}k tokens{RESET}")
     return dropped
 
 
+MUTATORS = {"write_file", "edit_file", "multi_edit"}
+
+
 def agent_turn(messages, user_input):
     messages.append({"role": "user", "content": user_input})
+    # ponytail: two loop-breakers a weak local model needs. `edited`/`verified` gate the
+    # verify-after-edit nudge (once); `prev_key` skips a tool call identical to the last one.
+    edited = verified = nudged = False
+    prev_key = None
     for _ in range(MAX_STEPS):
         trim(messages)
         msg = chat(messages)
         messages.append(msg)
         if not msg.get("tool_calls"):
+            if edited and not verified and not nudged:  # don't stop on unverified edits
+                nudged = True
+                messages.append({"role": "user", "content":
+                    "You changed files but ran nothing to check them. Run the build or a test "
+                    "(bash), or state why no check applies — then give your final summary."})
+                continue
             return
         for tc in msg["tool_calls"]:
             name = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"] or "{}")
             except json.JSONDecodeError as e:
-                args, result = {}, f"ERROR: malformed tool arguments: {e}"
+                result = f"ERROR: malformed tool arguments: {e}"
             else:
-                preview = args.get("command") or args.get("path") or ""
-                print(f"{DIM}→ {name} {preview}{RESET}")
-                result = run_tool(name, args)
+                key = (name, tc["function"]["arguments"] or "")
+                if key == prev_key:  # identical back-to-back call — a loop, don't rerun it
+                    result = ("[skipped: identical to your previous call. Repeating it changes "
+                              "nothing — make a different change, verify, or stop and summarize.]")
+                else:
+                    preview = args.get("command") or args.get("path") or ""
+                    print(f"{DIM}→ {name} {preview}{RESET}")
+                    result = run_tool(name, args)
+                    if name in MUTATORS and not result.startswith("ERROR"):
+                        edited, verified = True, False
+                    elif name == "bash" and edited:
+                        verified = True
+                prev_key = key
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
     messages.append({"role": "user", "content":
                      "Step limit reached. Summarize progress and stop."})
@@ -677,6 +724,7 @@ def repl():
         if user_input == "/new":
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             LAST_USAGE = None  # else the meter keeps showing the pre-clear token count
+            _READ_SEEN.clear()
             print(f"{DIM}context cleared{RESET}")
             continue
         if user_input == "/tokens":
@@ -754,6 +802,42 @@ def selftest():
         assert f.read() == "hello from sidekick", "tool execution failed"
     assert messages[-1]["content"] == "done: wrote probe", "final answer missing"
     assert any(m["role"] == "tool" for m in messages), "tool result not in transcript"
+    assert any("ran nothing to check" in (m.get("content") or "")
+               for m in messages if m["role"] == "user"), "verify-after-edit nudge should fire"
+
+    # consecutive-duplicate breaker: an identical back-to-back call is skipped, ending the loop
+    loopf = os.path.join(tempfile.mkdtemp(), "loop.txt")
+    tool_write_file(loopf, "x\n")
+    _READ_SEEN.clear()
+
+    class LoopMock(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            tools = [m for m in body["messages"] if m["role"] == "tool"]
+            if tools and "skipped: identical" in tools[-1]["content"]:
+                chunks = [{"delta": {"content": "stopped"}}]  # loop broken → answer
+            else:  # keep issuing the same read — a stuck model
+                args = json.dumps({"path": loopf})
+                chunks = [{"delta": {"tool_calls": [{"index": 0, "id": "call_r",
+                          "function": {"name": "read_file", "arguments": args}}]}}]
+            for c in chunks:
+                self.wfile.write(f"data: {json.dumps({'choices': [c]})}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+
+        def log_message(self, *a):
+            pass
+
+    srv2 = http.server.HTTPServer(("127.0.0.1", 0), LoopMock)
+    threading.Thread(target=srv2.serve_forever, daemon=True).start()
+    BASE_URL = f"http://127.0.0.1:{srv2.server_port}/v1"
+    m2 = [{"role": "system", "content": "s"}]
+    agent_turn(m2, "read it")
+    assert m2[-1]["content"] == "stopped", "loop should end once the dup call is skipped"
+    assert any("skipped: identical" in (m.get("content") or "") for m in m2), "dup not skipped"
+    BASE_URL = _saved_url
 
     # usage-only frame captured (also exercises the empty-choices guard in chat())
     assert LAST_USAGE and LAST_USAGE["prompt_tokens"] == 100, "server usage not captured"
@@ -801,6 +885,11 @@ def selftest():
     assert "blocked" not in tool_bash("git log -1")
     assert "blocked" not in tool_bash("git -C /tmp status && git branch --show-current")
     assert "truncated" not in tool_read_file(probe)
+
+    # re-read guard: unchanged re-read is deduped; a real on-disk change re-enables the read
+    assert "already read" in tool_read_file(probe), "unchanged re-read should be deduped"
+    tool_write_file(probe, "changed on disk\n")
+    assert "already read" not in tool_read_file(probe), "read after change should return content"
 
     # input editor: layout, key handling, escape parsing (no TTY needed)
     rows, cr, cc = _layout("> abc", 5, 80)
