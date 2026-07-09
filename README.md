@@ -34,9 +34,11 @@ you can see how close you are before old turns get dropped; it warns near the
 limit and prints a line whenever it trims. The count is the server's **real**
 token usage (requested via `stream_options.include_usage`) once you've sent a
 turn, and a `~` char-estimate before that. `/tokens` breaks usage down by role
-and shows the measured prompt/completion split. Conversation memory is ~28k
-tokens, oldest turns dropped first (server hard cap 32k, set by `-c` in serve.sh;
-q8 KV cache + flash attention keep it in RAM).
+and shows the measured prompt/completion split. Conversation memory defaults to
+~28k tokens (`SIDEKICK_CTX_TOKENS`), oldest turns dropped first. The server hard
+cap is set by `-c` in serve.sh — now 98k, with q4 KV cache + flash attention
+keeping it in RAM. Raise `SIDEKICK_CTX_TOKENS` toward that cap (e.g. 90000) for
+long single tasks that shouldn't lose their instructions mid-run.
 
 ### Input
 
@@ -65,6 +67,23 @@ Tools: `read_file` (line-numbered, 400-line pages) · `write_file` ·
 `bash` (120s timeout — covers ls, grep, git, running code).
 
 History is trimmed oldest-first past ~28k tokens; tool output is capped at 8k chars.
+
+### Headless / scripted use
+
+Pipe a task on stdin and Sidekick runs it **once** and exits, instead of opening the
+REPL — the whole of stdin is read as a single task (not line-by-line), so multi-line
+briefs stay intact:
+
+```sh
+SIDEKICK_CTX_TOKENS=90000 ./sidekick.py ~/dev/some-repo < brief.txt
+```
+
+The live reasoning/tool trace goes to **stderr**; **stdout is only the final answer**,
+so a caller can capture a clean result. Each run starts from a fresh context (system
+prompt + your task), so it's stateless — good for handing one scoped task to Sidekick
+from another agent or a script. This is how the Claude Code `orinth` subagent drives it:
+Claude writes a tight intent brief with an acceptance check, Orinth explores + codes +
+verifies, and Claude reviews the resulting diff.
 
 ## Config (env vars)
 

@@ -2,6 +2,7 @@
 # Sidekick — minimal local coding agent. One trusted user, one local model server.
 # Talks to any OpenAI-compatible /chat/completions endpoint (llama-server, LM Studio).
 # stdlib only. Run: ./sidekick.py   Self-check: ./sidekick.py --selftest
+import contextlib
 import json
 import os
 import re
@@ -271,6 +272,20 @@ def agent_turn(messages, user_input):
     messages.append({"role": "user", "content":
                      "Step limit reached. Summarize progress and stop."})
     messages.append(chat(messages))
+
+
+def run_task(task):
+    """Headless one-shot: run the agent loop once on a fresh context, return the
+    final answer text. Used when a task is piped in (e.g. a Claude Code subagent).
+    ponytail: the deliberate non-interactive entry point — Claude briefs, Orinth works.
+    The streaming loop trace (reasoning, tool previews) is sent to stderr so stdout
+    stays clean; the caller reads only the returned final answer, not the transcript.
+    Context is fresh per call, so each delegation is stateless — no cross-task drift.
+    trim() already protects messages[0] (system) and messages[1] (the task brief)."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    with contextlib.redirect_stdout(sys.stderr):
+        agent_turn(messages, task)
+    return (messages[-1].get("content") or "").strip()
 
 
 # ── input editor ──────────────────────────────────────────────────────────────
@@ -669,6 +684,14 @@ def selftest():
     assert messages[-1]["content"] == "done: wrote probe", "final answer missing"
     assert any(m["role"] == "tool" for m in messages), "tool result not in transcript"
 
+    # headless run_task: returns the final answer, leaks nothing to stdout (trace→stderr)
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        answer = run_task("create the probe file")
+    assert answer == "done: wrote probe", f"run_task should return the final answer, got {answer!r}"
+    assert buf.getvalue() == "", "run_task must keep stdout clean (trace goes to stderr)"
+
     # usage-only frame captured (also exercises the empty-choices guard in chat())
     assert LAST_USAGE and LAST_USAGE["prompt_tokens"] == 100, "server usage not captured"
     assert not format_meter(messages).startswith("ctx ~"), "meter should use measured tokens"
@@ -748,5 +771,9 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
+    elif not sys.stdin.isatty():          # task piped in → one-shot headless run
+        task = sys.stdin.read().strip()   # whole stdin is ONE task, not line-by-line
+        if task:
+            print(run_task(task))         # stdout = final answer only
     else:
         repl()

@@ -80,6 +80,9 @@
       "Bash(grep -vE '^\\\\s*$')",
       "Bash(grep -vE '^\\\\s*$|^\\\\x1b\\\\[2m')",
       "Bash(python3 /Users/isaaclimb/Documents/Orinth-Sidekick/sidekick.py --selftest)"
+    ],
+    "additionalDirectories": [
+      "/Users/isaaclimb/.claude/agents"
     ]
   }
 }
