@@ -36,9 +36,11 @@ token usage (requested via `stream_options.include_usage`) once you've sent a
 turn, and a `~` char-estimate before that. `/tokens` breaks usage down by role
 and shows the measured prompt/completion split. Conversation memory defaults to
 ~28k tokens (`SIDEKICK_CTX_TOKENS`), oldest turns dropped first. The server hard
-cap is set by `-c` in serve.sh — now 98k, with q4 KV cache + flash attention
-keeping it in RAM. Raise `SIDEKICK_CTX_TOKENS` toward that cap (e.g. 90000) for
-long single tasks that shouldn't lose their instructions mid-run.
+cap is set by `-c` in serve.sh — 64k (q4 KV cache + flash attention keep it in
+RAM; that's the tested ceiling on a 32 GB Mac at the default GPU wired limit —
+98k OOMs the Metal compute buffer unless you raise `iogpu.wired_limit_mb`). Raise
+`SIDEKICK_CTX_TOKENS` toward the cap (e.g. 55000) for long single tasks that
+shouldn't lose their instructions mid-run.
 
 ### Input
 
