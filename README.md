@@ -85,13 +85,14 @@ recalled; slash commands aren't saved), so ↑ recalls what you typed yesterday.
 
 ## How it works
 
-Sidekick sends your conversation plus four tool schemas to the local server and
+Sidekick sends your conversation plus five tool schemas to the local server and
 loops: the model streams either text (shown to you) or tool calls, which Sidekick
 executes and feeds back, until the model answers in plain text (max 40 steps).
 
 Tools: `read_file` (line-numbered, 400-line pages) · `write_file` ·
-`edit_file` (exact-unique-match replace; refuses ambiguous edits) ·
-`bash` (120s timeout — covers ls, grep, git, running code).
+`edit_file` (exact-unique-match replace, or a `start_line`/`end_line` range when an exact
+match is awkward) · `multi_edit` (several edits to one file in one atomic call) ·
+`bash` (configurable timeout, default 300s — covers ls, grep, git, running code and tests).
 
 History is trimmed oldest-first past ~28k tokens; tool output is capped at 8k chars.
 
@@ -101,6 +102,7 @@ History is trimmed oldest-first past ~28k tokens; tool output is capped at 8k ch
 |---|---|---|
 | `SIDEKICK_URL` | `http://localhost:8321/v1` | any OpenAI-compatible server (LM Studio: `http://localhost:1234/v1`) |
 | `SIDEKICK_CTX_TOKENS` | `28000` | history budget before old turns are dropped |
+| `SIDEKICK_BASH_TIMEOUT` | `300` | per-command bash timeout (s); raise for slow builds/tests |
 | `SIDEKICK_MODEL` | `local` | model name sent to the server (llama-server ignores it) |
 | `SIDEKICK_HISTFILE` | `~/.sidekick_history` | where prompt history is stored (↑/↓ recall) |
 

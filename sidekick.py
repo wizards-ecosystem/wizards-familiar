@@ -24,6 +24,7 @@ MODEL = os.environ.get("SIDEKICK_MODEL", "local")
 CTX_CHARS = int(os.environ.get("SIDEKICK_CTX_TOKENS", "28000")) * 3  # ~3 chars/token, code-heavy
 MAX_TOOL_OUTPUT = 8000
 MAX_STEPS = 40
+BASH_TIMEOUT = int(os.environ.get("SIDEKICK_BASH_TIMEOUT", "300"))  # seconds; raise for slow builds/tests
 HISTFILE = os.path.expanduser(os.environ.get("SIDEKICK_HISTFILE", "~/.sidekick_history"))
 
 LAST_USAGE = None  # real token counts from the server's last stream, if it reports them
@@ -45,7 +46,8 @@ Platform: macOS (zsh available via the bash tool).
 
 Use the tools to inspect and change code. Rules:
 - Read a file before editing it. Keep edits minimal and targeted.
-- Prefer edit_file for small changes; write_file only for new files or full rewrites.
+- Prefer edit_file for small changes; use multi_edit to change several spots in one file at once;
+  write_file only for new files or full rewrites.
 - Use bash for everything else: ls, grep, find, git, running code and tests.
 - Verify your work (run the code or a quick check) before declaring done.
 - Be concise. When the task is complete, reply with a short summary, no tool call.{PROJECT_NOTES}"""
@@ -67,15 +69,31 @@ TOOLS = [
         }, "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "edit_file",
-        "description": "Replace an exact, unique substring in a file. Fails if absent or ambiguous.",
+        "description": "Replace text in a file. Default: give 'old' (an exact, unique substring) "
+                       "and 'new'. If an exact match is hard (whitespace/ambiguity), instead give "
+                       "'start_line' and 'end_line' (1-based, inclusive) to replace that line range "
+                       "with 'new' (empty 'new' deletes the lines).",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
-            "old": {"type": "string"},
+            "old": {"type": "string", "description": "exact unique substring to replace (omit if using line range)"},
             "new": {"type": "string"},
-        }, "required": ["path", "old", "new"]}}},
+            "start_line": {"type": "integer", "description": "1-based first line to replace (line-range mode)"},
+            "end_line": {"type": "integer", "description": "1-based last line to replace, inclusive"},
+        }, "required": ["path", "new"]}}},
+    {"type": "function", "function": {
+        "name": "multi_edit",
+        "description": "Apply several exact-match edits to one file in a single call, in order. "
+                       "Atomic: if any 'old' is missing or non-unique at its turn, nothing is written. "
+                       "Use for multi-spot changes to avoid repeated round-trips.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "edits": {"type": "array", "items": {"type": "object", "properties": {
+                "old": {"type": "string"}, "new": {"type": "string"},
+            }, "required": ["old", "new"]}},
+        }, "required": ["path", "edits"]}}},
     {"type": "function", "function": {
         "name": "bash",
-        "description": "Run a shell command in the working directory. 120s timeout.",
+        "description": f"Run a shell command in the working directory. {BASH_TIMEOUT}s timeout.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
         }, "required": ["command"]}}},
@@ -102,9 +120,22 @@ def tool_write_file(path, content, **_):
     return f"wrote {len(content)} chars to {path}"
 
 
-def tool_edit_file(path, old, new, **_):
+def tool_edit_file(path, old=None, new="", start_line=None, end_line=None, **_):
     with open(path, errors="replace") as f:
         text = f.read()
+    if start_line is not None:  # line-range replace — a fallback when exact match is awkward
+        lines = text.splitlines(keepends=True)
+        s = int(start_line) - 1
+        e = int(end_line) if end_line is not None else int(start_line)
+        if s < 0 or s >= len(lines):
+            return f"ERROR: start_line {start_line} out of range (file has {len(lines)} lines)"
+        repl = [] if new == "" else [new if new.endswith("\n") else new + "\n"]
+        lines[s:e] = repl
+        with open(path, "w") as f:
+            f.write("".join(lines))
+        return f"replaced lines {start_line}-{e} in {path}"
+    if not old:
+        return "ERROR: provide 'old' (exact match) or 'start_line'/'end_line'"
     n = text.count(old)
     if n == 0:
         return "ERROR: old string not found in file"
@@ -113,6 +144,23 @@ def tool_edit_file(path, old, new, **_):
     with open(path, "w") as f:
         f.write(text.replace(old, new, 1))
     return f"edited {path}"
+
+
+def tool_multi_edit(path, edits, **_):
+    # atomic: validate+apply sequentially in memory, write only if all succeed
+    with open(path, errors="replace") as f:
+        text = f.read()
+    for i, e in enumerate(edits, 1):
+        old = e["old"]
+        n = text.count(old)
+        if n == 0:
+            return f"ERROR: edit {i}: old string not found (nothing written)"
+        if n > 1:
+            return f"ERROR: edit {i}: old string appears {n} times, add context (nothing written)"
+        text = text.replace(old, e["new"], 1)
+    with open(path, "w") as f:
+        f.write(text)
+    return f"applied {len(edits)} edits to {path}"
 
 
 GIT_RO = {"status", "log", "diff", "show", "blame", "grep", "ls-files", "ls-remote",
@@ -139,15 +187,15 @@ def tool_bash(command, **_):
     if blocked:
         return blocked
     try:
-        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=BASH_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return "ERROR: command timed out after 120s"
+        return f"ERROR: command timed out after {BASH_TIMEOUT}s (raise SIDEKICK_BASH_TIMEOUT)"
     out = (r.stdout + r.stderr).strip()
     return f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
 
 
 TOOL_IMPL = {"read_file": tool_read_file, "write_file": tool_write_file,
-             "edit_file": tool_edit_file, "bash": tool_bash}
+             "edit_file": tool_edit_file, "multi_edit": tool_multi_edit, "bash": tool_bash}
 
 
 def run_tool(name, args):
@@ -688,6 +736,24 @@ def selftest():
     assert "not found" in tool_edit_file(probe, "nope", "x")
     tool_write_file(probe, "aa")
     assert "2 times" in tool_edit_file(probe, "a", "b")
+
+    # line-range edit (fallback mode) and multi_edit (atomic)
+    tool_write_file(probe, "one\ntwo\nthree\n")
+    tool_edit_file(probe, new="TWO", start_line=2, end_line=2)
+    with open(probe) as f:
+        assert f.read() == "one\nTWO\nthree\n", "line-range replace"
+    tool_edit_file(probe, new="", start_line=1, end_line=1)  # delete line 1
+    with open(probe) as f:
+        assert f.read() == "TWO\nthree\n", "line-range delete"
+    tool_write_file(probe, "aXbYc")
+    assert "3 edits" in tool_multi_edit(probe, [{"old": "X", "new": "1"}, {"old": "Y", "new": "2"}, {"old": "c", "new": "3"}])
+    with open(probe) as f:
+        assert f.read() == "a1b2" "3", "multi_edit applied in order"
+    tool_write_file(probe, "aXbXc")  # ambiguous 2nd edit → atomic abort, no write
+    assert "nothing written" in tool_multi_edit(probe, [{"old": "a", "new": "Z"}, {"old": "X", "new": "1"}])
+    with open(probe) as f:
+        assert f.read() == "aXbXc", "multi_edit atomic: no partial write"
+
     assert tool_bash("exit 3").startswith("exit 3")
     assert "blocked" in tool_bash("git commit -m hi")
     assert "blocked" in tool_bash("cd /tmp && git merge feat/x")
