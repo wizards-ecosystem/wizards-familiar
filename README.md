@@ -2,14 +2,13 @@
 
 A fully local coding agent. One trusted user, one machine, nothing sent anywhere.
 
-This repo is a complete, portable setup package: the agent, the model launcher, and a
-Claude Code integration that lets Claude delegate scoped coding tasks to the local model.
+This repo is a complete, portable setup package: the standalone local coding agent and
+the model launcher. Use it in place of a cloud agent for tasks it can handle — it runs
+entirely on your machine and costs nothing per token.
 
 - **`sidekick.py`** — the entire agent: a stdlib-only Python CLI (no pip installs).
 - **`serve.sh`** — starts the model: Ornith-1.0-35B (Q4_K_M GGUF) via llama.cpp's
   OpenAI-compatible `llama-server`. Auto-scales context to the GPU wired limit.
-- **`claude/`** — the Claude Code integration: an `orinth` subagent, an `/orinth` slash
-  command, and a CLAUDE.md delegation rule. Installed with **`install.sh`**.
 - **Model file** — `~/Models/ornith-1.0-35b-Q4_K_M.gguf` (21.2 GB, SHA-256 verified
   against Hugging Face: `ff25291b…dbec002`).
 
@@ -32,7 +31,7 @@ Claude Code integration that lets Claude delegate scoped coding tasks to the loc
    ```
    `serve.sh` detects this and bumps `-c` automatically (65536 → 131072).
 4. **Start the model**: `./serve.sh` (leave running; serves port 8321).
-5. **Install the Claude Code integration**: `./install.sh` (see below).
+5. **Use it**: `sidekick ~/dev/some-repo` (see Quickstart).
 
 ## Quickstart
 
@@ -53,36 +52,6 @@ That's the whole "connection": whatever folder Sidekick starts in is the
 workspace — the model is told the path, and all file/bash tools work there.
 Optional: drop a `SIDEKICK.md` in a repo (build commands, layout, conventions)
 and it's added to the system prompt automatically.
-
-## Claude Code integration — Orinth as a subagent
-
-Let Claude Code (in any project) delegate scoped coding tasks to the local Orinth model:
-Claude writes a short intent brief, Orinth does the real work (explores, codes, verifies),
-and Claude reviews the diff. Claude spends a little on orchestration; the code generation
-runs on Orinth for free and offline.
-
-```sh
-./install.sh          # symlinks the subagent + /orinth command into ~/.claude, adds the rule
-./install.sh --uninstall
-```
-
-What it installs (source of truth stays in this repo under `claude/`):
-- **`claude/agents/orinth.md`** — the `orinth` subagent: health-checks the server (auto-starts
-  it), writes the brief, runs Sidekick headless against the current project, and reviews the
-  result with the acceptance check.
-- **`claude/commands/orinth.md`** — `/orinth <task>` to force delegation.
-- **`claude/CLAUDE.orinth.md`** — a rule merged into `~/.claude/CLAUDE.md` so Claude
-  auto-delegates the right tasks (self-contained, ≤2 files, clear pass/fail check, non-trivial).
-
-**Use it:** `/orinth add retry-with-backoff to the API client, covered by a test`, or just
-describe such a task and Claude will delegate on its own. Delegate scoped, verifiable,
-generation-heavy work; keep fuzzy specs, broad refactors, and subtle debugging on Claude.
-
-**How the plumbing works:** the subagent pipes the brief to Sidekick's headless mode
-(`SIDEKICK_CTX_TOKENS=55000 sidekick.py <project> < brief`). Headless mode reads all of
-stdin as one task, runs the loop once statelessly, and prints only the final answer to
-stdout (the reasoning/tool trace goes to stderr), so Claude ingests a small result rather
-than the whole transcript — that's what keeps the token math in the black.
 
 Reasoning streams dim, answers stream normal, tool calls print as `→ name arg`.
 A live token meter prints above each prompt (`ctx 12.3k / 28k tokens (44%)`), so
@@ -138,10 +107,8 @@ SIDEKICK_CTX_TOKENS=90000 ./sidekick.py ~/dev/some-repo < brief.txt
 
 The live reasoning/tool trace goes to **stderr**; **stdout is only the final answer**,
 so a caller can capture a clean result. Each run starts from a fresh context (system
-prompt + your task), so it's stateless — good for handing one scoped task to Sidekick
-from another agent or a script. This is how the Claude Code `orinth` subagent drives it:
-Claude writes a tight intent brief with an acceptance check, Orinth explores + codes +
-verifies, and Claude reviews the resulting diff.
+prompt + your task), so it's stateless — good for scripting one scoped task at a time
+(CI checks, batch edits, a shell wrapper) without the interactive REPL.
 
 ## Config (env vars)
 

@@ -276,12 +276,13 @@ def agent_turn(messages, user_input):
 
 def run_task(task):
     """Headless one-shot: run the agent loop once on a fresh context, return the
-    final answer text. Used when a task is piped in (e.g. a Claude Code subagent).
-    ponytail: the deliberate non-interactive entry point — Claude briefs, Orinth works.
+    final answer text. Used when a task is piped in (`sidekick <dir> < task.txt`) for
+    scripting or non-interactive runs.
+    ponytail: the deliberate non-interactive entry point.
     The streaming loop trace (reasoning, tool previews) is sent to stderr so stdout
     stays clean; the caller reads only the returned final answer, not the transcript.
-    Context is fresh per call, so each delegation is stateless — no cross-task drift.
-    trim() already protects messages[0] (system) and messages[1] (the task brief)."""
+    Context is fresh per call, so each run is stateless — no cross-task drift.
+    trim() already protects messages[0] (system) and messages[1] (the task)."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     with contextlib.redirect_stdout(sys.stderr):
         agent_turn(messages, task)
