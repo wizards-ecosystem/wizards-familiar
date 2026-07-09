@@ -95,21 +95,6 @@ Tools: `read_file` (line-numbered, 400-line pages) · `write_file` ·
 
 History is trimmed oldest-first past ~28k tokens; tool output is capped at 8k chars.
 
-### Headless / scripted use
-
-Pipe a task on stdin and Sidekick runs it **once** and exits, instead of opening the
-REPL — the whole of stdin is read as a single task (not line-by-line), so multi-line
-briefs stay intact:
-
-```sh
-SIDEKICK_CTX_TOKENS=90000 ./sidekick.py ~/dev/some-repo < brief.txt
-```
-
-The live reasoning/tool trace goes to **stderr**; **stdout is only the final answer**,
-so a caller can capture a clean result. Each run starts from a fresh context (system
-prompt + your task), so it's stateless — good for scripting one scoped task at a time
-(CI checks, batch edits, a shell wrapper) without the interactive REPL.
-
 ## Config (env vars)
 
 | Var | Default | Purpose |
