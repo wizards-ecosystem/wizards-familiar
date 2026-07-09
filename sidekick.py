@@ -21,7 +21,7 @@ except ImportError:  # non-unix; read_input() falls back to plain input()
 
 BASE_URL = os.environ.get("SIDEKICK_URL", "http://localhost:8321/v1")
 MODEL = os.environ.get("SIDEKICK_MODEL", "local")
-CTX_CHARS = int(os.environ.get("SIDEKICK_CTX_TOKENS", "28000")) * 3  # ~3 chars/token, code-heavy
+CTX_CHARS = 55000 * 3  # ~3 chars/token; resolve_ctx_budget() sizes this to the server window at startup
 MAX_TOOL_OUTPUT = 8000
 MAX_STEPS = 40
 BASH_TIMEOUT = int(os.environ.get("SIDEKICK_BASH_TIMEOUT", "300"))  # seconds; raise for slow builds/tests
@@ -270,6 +270,24 @@ def chat(messages):
              "function": {"name": t["name"], "arguments": t["arguments"]}}
             for i, t in sorted(tool_calls.items())]
     return msg
+
+
+def resolve_ctx_budget():
+    """Size the conversation budget to the server's real context window (~80%, leaving
+    headroom so a long reasoning turn isn't truncated). Explicit SIDEKICK_CTX_TOKENS wins;
+    safe fallback if the server can't be probed. Returns (budget_tokens, server_ctx|None)."""
+    override = os.environ.get("SIDEKICK_CTX_TOKENS")
+    if override:
+        return int(override), None
+    try:
+        with urllib.request.urlopen(BASE_URL.rsplit("/v1", 1)[0] + "/props", timeout=2) as r:
+            props = json.load(r)
+        n = (props.get("default_generation_settings") or {}).get("n_ctx") or props.get("n_ctx")
+        if n:
+            return int(int(n) * 0.8), int(n)
+    except Exception:  # server down or /props unavailable — fall back
+        pass
+    return 55000, None
 
 
 def context_chars(messages):
@@ -634,9 +652,13 @@ HELP = f"""{BOLD}commands{RESET}
 
 
 def repl():
-    global LAST_USAGE
+    global LAST_USAGE, CTX_CHARS
+    budget, server_ctx = resolve_ctx_budget()
+    CTX_CHARS = budget * 3
+    ctx_note = (f"ctx {budget // 1000}k / {server_ctx // 1000}k window" if server_ctx
+                else f"ctx {budget // 1000}k")
     print(f"{BOLD}Sidekick{RESET} — local coding agent")
-    print(f"{DIM}server {BASE_URL} · cwd {os.getcwd()} · /help for keys · ctrl-d quits{RESET}")
+    print(f"{DIM}server {BASE_URL} · cwd {os.getcwd()} · {ctx_note} · /help · ctrl-d quits{RESET}")
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     history = load_history()
     while True:
@@ -703,12 +725,28 @@ def selftest():
             self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())  # usage-only frame
             self.wfile.write(b"data: [DONE]\n\n")
 
+        def do_GET(self):  # /props for resolve_ctx_budget()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"default_generation_settings": {"n_ctx": 10000}}).encode())
+
         def log_message(self, *a):
             pass
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), Mock)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     BASE_URL = f"http://127.0.0.1:{srv.server_port}/v1"
+
+    # context budget resolution: probe (80% of server n_ctx), env override, fallback
+    os.environ.pop("SIDEKICK_CTX_TOKENS", None)
+    assert resolve_ctx_budget() == (8000, 10000), "budget should be 80% of probed n_ctx"
+    os.environ["SIDEKICK_CTX_TOKENS"] = "12345"
+    assert resolve_ctx_budget() == (12345, None), "env override should win"
+    os.environ.pop("SIDEKICK_CTX_TOKENS", None)
+    _saved_url, BASE_URL = BASE_URL, "http://127.0.0.1:1/v1"  # unreachable
+    assert resolve_ctx_budget() == (55000, None), "fallback when server unreachable"
+    BASE_URL = _saved_url
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     agent_turn(messages, "create the probe file")

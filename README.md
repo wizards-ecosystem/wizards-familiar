@@ -54,18 +54,19 @@ Optional: drop a `SIDEKICK.md` in a repo (build commands, layout, conventions)
 and it's added to the system prompt automatically.
 
 Reasoning streams dim, answers stream normal, tool calls print as `→ name arg`.
-A live token meter prints above each prompt (`ctx 12.3k / 28k tokens (44%)`), so
+A live token meter prints above each prompt (`ctx 12.3k / 105k tokens (12%)`), so
 you can see how close you are before old turns get dropped; it warns near the
 limit and prints a line whenever it trims. The count is the server's **real**
 token usage (requested via `stream_options.include_usage`) once you've sent a
 turn, and a `~` char-estimate before that. `/tokens` breaks usage down by role
-and shows the measured prompt/completion split. Conversation memory defaults to
-~28k tokens (`SIDEKICK_CTX_TOKENS`), oldest turns dropped first. The server hard
-cap is set by `-c` in serve.sh — 64k (q4 KV cache + flash attention keep it in
-RAM; that's the tested ceiling on a 32 GB Mac at the default GPU wired limit —
-98k OOMs the Metal compute buffer unless you raise `iogpu.wired_limit_mb`). Raise
-`SIDEKICK_CTX_TOKENS` toward the cap (e.g. 55000) for long single tasks that
-shouldn't lose their instructions mid-run.
+and shows the measured prompt/completion split. Conversation memory is **auto-sized
+to the server's window**: on startup Sidekick probes llama-server's `/props` and sets
+the budget to ~80% of its context (leaving headroom so a long reasoning turn isn't cut
+off), printed in the banner as `ctx 105k / 131k window`. Past that budget the oldest
+turns are dropped first — use `/new` to reset for a lean, focused chat. The server hard
+cap is set by `-c` in serve.sh (65536 at the default GPU wired limit, 131072 when it's
+raised — see serve.sh); `SIDEKICK_CTX_TOKENS` overrides the auto-sizing if you want a
+fixed budget.
 
 ### Input
 
@@ -94,14 +95,14 @@ Tools: `read_file` (line-numbered, 400-line pages) · `write_file` ·
 match is awkward) · `multi_edit` (several edits to one file in one atomic call) ·
 `bash` (configurable timeout, default 300s — covers ls, grep, git, running code and tests).
 
-History is trimmed oldest-first past ~28k tokens; tool output is capped at 8k chars.
+History is trimmed oldest-first past the auto-sized budget; tool output is capped at 8k chars.
 
 ## Config (env vars)
 
 | Var | Default | Purpose |
 |---|---|---|
 | `SIDEKICK_URL` | `http://localhost:8321/v1` | any OpenAI-compatible server (LM Studio: `http://localhost:1234/v1`) |
-| `SIDEKICK_CTX_TOKENS` | `28000` | history budget before old turns are dropped |
+| `SIDEKICK_CTX_TOKENS` | auto (~80% of server window) | history budget before old turns drop; set to override the auto-sizing |
 | `SIDEKICK_BASH_TIMEOUT` | `300` | per-command bash timeout (s); raise for slow builds/tests |
 | `SIDEKICK_MODEL` | `local` | model name sent to the server (llama-server ignores it) |
 | `SIDEKICK_HISTFILE` | `~/.sidekick_history` | where prompt history is stored (↑/↓ recall) |
