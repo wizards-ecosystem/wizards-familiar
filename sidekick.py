@@ -28,6 +28,7 @@ BASH_TIMEOUT = int(os.environ.get("SIDEKICK_BASH_TIMEOUT", "300"))  # seconds; r
 HISTFILE = os.path.expanduser(os.environ.get("SIDEKICK_HISTFILE", "~/.sidekick_history"))
 
 LAST_USAGE = None  # real token counts from the server's last stream, if it reports them
+PLAN = False  # /plan: read-only mode — edit tools disabled, model proposes changes instead
 
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
 
@@ -53,6 +54,10 @@ Use the tools to inspect and change code. Rules:
 - Use bash for everything else: ls, grep, find, git, running code and tests.
 - Verify your work (run the code or a quick check) before declaring done.
 - Be concise. When the task is complete, reply with a short summary, no tool call.{PROJECT_NOTES}"""
+
+PLAN_SUFFIX = ("\n\n[PLAN MODE] You are read-only. The write/edit tools are disabled — do not try "
+               "to change files. Explore with read_file and bash (read-only git only), then deliver "
+               "a concrete implementation plan: which files change, what changes in each, and why.")
 
 TOOLS = [
     {"type": "function", "function": {
@@ -222,6 +227,9 @@ TOOL_IMPL = {"read_file": tool_read_file, "write_file": tool_write_file,
 
 
 def run_tool(name, args):
+    if PLAN and name in MUTATORS:
+        return ("ERROR: plan mode is read-only — the edit tools are off. Propose the change in "
+                "your plan instead of making it (/plan to exit plan mode).")
     try:
         result = TOOL_IMPL[name](**args)
     except Exception as e:  # bad path, bad args — feed the error back to the model
@@ -234,7 +242,7 @@ def run_tool(name, args):
 def chat(messages):
     """Stream one completion. Prints content live, returns the assistant message."""
     global LAST_USAGE
-    payload = {"model": MODEL, "messages": messages, "tools": TOOLS, "stream": True,
+    payload = {"model": MODEL, "messages": messages, "tools": active_tools(), "stream": True,
                "stream_options": {"include_usage": True}}  # ask for real token counts
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",
@@ -340,6 +348,10 @@ def trim(messages):
 
 
 MUTATORS = {"write_file", "edit_file", "multi_edit"}
+
+
+def active_tools():
+    return [t for t in TOOLS if t["function"]["name"] not in MUTATORS] if PLAN else TOOLS
 
 
 def agent_turn(messages, user_input):
@@ -687,6 +699,7 @@ def cmd_tokens(messages):
 
 HELP = f"""{BOLD}commands{RESET}
   /new      clear the conversation (keeps the system prompt)
+  /plan     toggle read-only plan mode (explore & propose, no edits)
   /tokens   detailed context-usage breakdown
   /help     this help
   /quit     exit (also ctrl-d on an empty line)
@@ -699,7 +712,7 @@ HELP = f"""{BOLD}commands{RESET}
 
 
 def repl():
-    global LAST_USAGE, CTX_CHARS
+    global LAST_USAGE, CTX_CHARS, PLAN
     budget, server_ctx = resolve_ctx_budget()
     CTX_CHARS = budget * 3
     ctx_note = (f"ctx {budget // 1000}k / {server_ctx // 1000}k window" if server_ctx
@@ -711,7 +724,7 @@ def repl():
     while True:
         try:
             print(f"\n{DIM}{format_meter(messages)}{RESET}")
-            user_input = read_input("› ", history).strip()
+            user_input = read_input("plan › " if PLAN else "› ", history).strip()
         except EOFError:
             print()
             return
@@ -726,6 +739,11 @@ def repl():
             LAST_USAGE = None  # else the meter keeps showing the pre-clear token count
             _READ_SEEN.clear()
             print(f"{DIM}context cleared{RESET}")
+            continue
+        if user_input == "/plan":
+            PLAN = not PLAN
+            messages[0]["content"] = SYSTEM_PROMPT + (PLAN_SUFFIX if PLAN else "")
+            print(f"{DIM}plan mode {'on — read-only, edits disabled' if PLAN else 'off'}{RESET}")
             continue
         if user_input == "/tokens":
             cmd_tokens(messages)
@@ -748,7 +766,7 @@ def repl():
 
 def selftest():
     """Mock the server, verify the full loop: tool call → execution → final answer."""
-    global BASE_URL, CTX_CHARS, LAST_USAGE, HISTFILE
+    global BASE_URL, CTX_CHARS, LAST_USAGE, HISTFILE, PLAN
     import http.server
     import tempfile
     import threading
@@ -885,6 +903,14 @@ def selftest():
     assert "blocked" not in tool_bash("git log -1")
     assert "blocked" not in tool_bash("git -C /tmp status && git branch --show-current")
     assert "truncated" not in tool_read_file(probe)
+
+    # plan mode: mutators vanish from the tool list and are hard-blocked at execution
+    PLAN = True
+    assert all(t["function"]["name"] not in MUTATORS for t in active_tools()), "plan hides mutators"
+    assert "read-only" in run_tool("write_file", {"path": probe, "content": "x"}), "plan blocks writes"
+    assert "blocked" not in run_tool("bash", {"command": "echo ok"}), "plan keeps bash for exploring"
+    PLAN = False
+    assert any(t["function"]["name"] == "write_file" for t in active_tools()), "normal mode restores mutators"
 
     # re-read guard: unchanged re-read is deduped; a real on-disk change re-enables the read
     assert "already read" in tool_read_file(probe), "unchanged re-read should be deduped"
