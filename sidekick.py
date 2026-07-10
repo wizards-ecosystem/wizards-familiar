@@ -114,6 +114,10 @@ _READ_SEEN = {}  # realpath -> {"sig": (mtime_ns, size), "offsets": set()}
 
 
 def tool_read_file(path, offset=1, **_):
+    if os.path.isdir(path):  # a weak model often reads a dir by mistake — list it, don't error
+        entries = sorted(os.listdir(path))
+        listing = "\n".join(e + ("/" if os.path.isdir(os.path.join(path, e)) else "") for e in entries)
+        return f"[{path} is a directory, {len(entries)} entries]\n{listing}" if entries else f"[{path} is an empty directory]"
     off = int(offset)
     rp = os.path.realpath(path)
     try:
@@ -911,6 +915,11 @@ def selftest():
     assert "blocked" not in run_tool("bash", {"command": "echo ok"}), "plan keeps bash for exploring"
     PLAN = False
     assert any(t["function"]["name"] == "write_file" for t in active_tools()), "normal mode restores mutators"
+
+    # reading a directory lists it instead of erroring (common weak-model mistake)
+    d = os.path.dirname(probe)
+    out = tool_read_file(d)
+    assert "is a directory" in out and os.path.basename(probe) in out, "dir read should list entries"
 
     # re-read guard: unchanged re-read is deduped; a real on-disk change re-enables the read
     assert "already read" in tool_read_file(probe), "unchanged re-read should be deduped"
