@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Sidekick — minimal local coding agent. One trusted user, one local model server.
-# Talks to any OpenAI-compatible /chat/completions endpoint (llama-server, LM Studio).
-# stdlib only. Run: ./sidekick.py   Self-check: ./sidekick.py --selftest
+# Sidekick — minimal local coding agent (stdlib only). See README.
 import json
 import os
 import re
@@ -107,9 +105,8 @@ TOOLS = [
 ]
 
 
-# ponytail: re-read guard. A local model tends to re-read the same file over and over,
-# bloating context and spinning. Return a stub for an unchanged re-read; cleared on trim
-# (so a read evicted from context can be fetched again) and on /new.
+# ponytail: re-read guard — stub an unchanged re-read so a weak model can't spin on it;
+# cleared on trim and /new so an evicted read can be fetched again.
 _READ_SEEN = {}  # realpath -> {"sig": (mtime_ns, size), "offsets": set()}
 
 
@@ -334,9 +331,8 @@ def est_tokens(messages):
 
 
 def trim(messages):
-    # ponytail: crude char-count trim; summarize-on-trim if quality suffers.
-    # Keeps [0] system and [1] the original task (dropping it makes the model drift),
-    # and drops tool results with their tool_calls message (orphans are a server 400).
+    # ponytail: crude char-count trim, summarize-on-trim if quality suffers. Keeps [0] system
+    # and [1] the task; drops tool results with their tool_calls message (orphans 400 the server).
     dropped = 0
     while context_chars(messages) > CTX_CHARS and len(messages) > 4:
         del messages[2]
@@ -360,8 +356,8 @@ def active_tools():
 
 def agent_turn(messages, user_input):
     messages.append({"role": "user", "content": user_input})
-    # ponytail: two loop-breakers a weak local model needs. `edited`/`verified` gate the
-    # verify-after-edit nudge (once); `prev_key` skips a tool call identical to the last one.
+    # ponytail: loop-breakers for a weak model — `edited`/`verified` gate the verify nudge
+    # (once), `prev_key` skips a tool call identical to the last one.
     edited = verified = nudged = False
     prev_key = None
     for _ in range(MAX_STEPS):
@@ -402,12 +398,8 @@ def agent_turn(messages, user_input):
     messages.append(chat(messages))
 
 
-# ── input editor ──────────────────────────────────────────────────────────────
-# Raw-mode multiline editor: Enter submits, Shift+Enter / Alt+Enter insert a newline,
-# and bracketed paste keeps multi-line pastes intact instead of submitting on the first
-# newline. Falls back to plain input() when stdin isn't a TTY (pipes, --selftest).
-# ponytail: full redraw per keystroke — O(buffer) per key; fine for prompt-sized text,
-# revisit only if pasting huge blobs gets janky.
+# ── input editor (raw-mode multiline; see README) ───────────────────────────────
+# ponytail: full redraw per keystroke — O(buffer)/key, fine for prompt-sized text.
 _ARROWS = {"A": ("up",), "B": ("down",), "C": ("right",), "D": ("left",),
            "H": ("home",), "F": ("end",)}
 
