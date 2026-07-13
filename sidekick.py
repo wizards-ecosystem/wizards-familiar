@@ -49,7 +49,8 @@ Use the tools to inspect and change code. Rules:
 - Diagnose the root cause before editing. Don't stack speculative fixes hoping one sticks.
 - Prefer edit_file for small changes; use multi_edit to change several spots in one file at once;
   write_file only for new files or full rewrites.
-- Use bash for everything else: ls, grep, find, git, running code and tests.
+- Use bash for everything else: grep, find, git, running code and tests — but read files with
+  read_file, never `cat`, so unchanged re-reads are deduped and long files paginate.
 - Verify your work (run the code or a quick check) before declaring done.
 - Be concise. When the task is complete, reply with a short summary, no tool call.{PROJECT_NOTES}"""
 
@@ -210,8 +211,27 @@ def git_guard(command):
     return None
 
 
+# ponytail: route a bare `cat file` through read_file so the re-read guard dedupes it — a weak
+# model reaches for cat and re-dumps the same file into context. Pipes/redirects/flags/globs/vars
+# fall through to real bash; cat is legitimate inside a pipeline.
+_BARE_CAT = re.compile(r"^\s*cat\s+(?P<args>[^|&;<>`$()]+?)\s*$")
+
+
+def bare_cat_paths(command):
+    m = _BARE_CAT.match(command)
+    if not m:
+        return None
+    parts = m.group("args").split()
+    if not parts or any(p.startswith("-") for p in parts):
+        return None
+    return parts
+
+
 def tool_bash(command, **_):
     # ponytail: git is read-only (guard above); everything else unsandboxed by design
+    paths = bare_cat_paths(command)
+    if paths and all(os.path.isfile(p) for p in paths):
+        return "\n".join(tool_read_file(p) for p in paths)
     blocked = git_guard(command)
     if blocked:
         return blocked
@@ -917,6 +937,15 @@ def selftest():
     assert "already read" in tool_read_file(probe), "unchanged re-read should be deduped"
     tool_write_file(probe, "changed on disk\n")
     assert "already read" not in tool_read_file(probe), "read after change should return content"
+
+    # bare `cat file` routes through read_file (line numbers + dedup); pipes/flags/globs don't
+    tool_write_file(probe, "L1\nL2\n")
+    _READ_SEEN.clear()
+    assert "1\tL1" in tool_bash(f"cat {probe}"), "bare cat should return read_file output"
+    assert "already read" in tool_bash(f"cat {probe}"), "second cat should dedupe like read_file"
+    assert bare_cat_paths("cat a.txt | grep x") is None, "cat in a pipe stays raw bash"
+    assert bare_cat_paths("cat -n a.txt") is None, "cat with flags stays raw bash"
+    assert tool_bash("cat /no/such/file/xyz").startswith("exit"), "missing file falls through to bash"
 
     # input editor: layout, key handling, escape parsing (no TTY needed)
     rows, cr, cc = _layout("> abc", 5, 80)
