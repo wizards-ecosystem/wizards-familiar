@@ -1,147 +1,141 @@
+<div align="center">
+
 # Orinth Sidekick
 
-A fully local coding agent. One trusted user, one machine, nothing sent anywhere.
+**A coding agent that runs entirely on your machine. One file, no dependencies, no cloud.**
 
-This repo is a complete, portable setup package: the standalone local coding agent and
-the model launcher. Use it in place of a cloud agent for tasks it can handle — it runs
-entirely on your machine and costs nothing per token.
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-success)](#why-stdlib-only)
+[![Inference](https://img.shields.io/badge/inference-100%25%20local-blue)](#what-it-is)
+[![Cost](https://img.shields.io/badge/cost-%240%20per%20token-brightgreen)](#why-it-exists)
+[![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey?logo=apple)](#requirements)
 
-- **`sidekick.py`** — the entire agent: a stdlib-only Python CLI (no pip installs).
-- **`serve.sh`** — starts the model: Ornith-1.0-35B (Q4_K_M GGUF) via llama.cpp's
-  OpenAI-compatible `llama-server`. Auto-scales context to the GPU wired limit.
-- **Model file** — `~/Models/ornith-1.0-35b-Q4_K_M.gguf` (21.2 GB, SHA-256 verified
-  against Hugging Face: `ff25291b…dbec002`).
+</div>
 
-## Setup on a new machine
+---
 
-1. **Prerequisites** (macOS, Apple Silicon; a 32 GB Mac runs the 35B at Q4):
-   ```sh
-   brew install llama.cpp        # provides llama-server
-   ```
-2. **Get the model** (~21 GB) into `~/Models/`:
-   ```sh
-   mkdir -p ~/Models && curl -L -C - --retry 100 --retry-all-errors \
-     -o ~/Models/ornith-1.0-35b-Q4_K_M.gguf \
-     "https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B-GGUF/resolve/main/ornith-1.0-35b-Q4_K_M.gguf"
-   ```
-3. **(Optional) more context** — the default is 64k, which works at the stock GPU wired
-   limit. For up to the model's full 256k on a 32 GB Mac, raise the wired limit (per boot):
-   ```sh
-   sudo sysctl iogpu.wired_limit_mb=28672
-   ```
-   `serve.sh` detects this and bumps `-c` automatically (65536 → 131072).
-4. **Start the model**: `./serve.sh` (leave running; serves port 8321).
-5. **Use it**: `sidekick ~/dev/some-repo` (see Quickstart).
+## Why it exists
+
+My team paused cloud AI while we reworked cost limits. Rather than lose the momentum, I built a
+coding agent that runs on my own laptop: no hosted model, no API key, no per-token cost, and nothing
+about my code leaving the machine.
+
+It turned into a good exercise in how much a capable coding assistant actually needs, versus how
+much a heavy toolchain just adds. The answer was **one Python file and zero dependencies**.
+
+## What it is
+
+Two pieces, about a thousand lines total:
+
+| File | Role |
+|---|---|
+| **`sidekick.py`** | The entire agent. Stdlib-only Python CLI: agent loop, tool calling, a raw-mode line editor, context management, streaming. No `pip install`, ever. |
+| **`serve.sh`** | The model launcher. Runs Ornith-1.0-35B (Q4_K_M GGUF) through llama.cpp's OpenAI-compatible `llama-server`, auto-scaling context to your GPU's wired limit. |
+
+```mermaid
+flowchart LR
+    A["sidekick.py<br/><i>stdlib-only CLI</i>"] -->|"OpenAI-compatible<br/>127.0.0.1:8321"| B["llama-server<br/><i>llama.cpp</i>"]
+    B --> C["Ornith-1.0-35B<br/><i>Q4_K_M, on-device</i>"]
+    A -->|"tools"| D["read · write · edit<br/>bash · glob"]
+    D --> E["your repo"]
+    style A fill:#2563EB,color:#fff
+    style C fill:#0EA5A5,color:#fff
+```
+
+Nothing in that diagram leaves the laptop.
+
+## Requirements
+
+- **macOS, Apple Silicon.** A 32 GB Mac runs the 35B at Q4.
+- **~21 GB of disk** for the model.
+- `brew install llama.cpp` (provides `llama-server`).
 
 ## Quickstart
 
-1. **Start the model** (terminal 1, leave it running):
-   ```sh
-   ~/Documents/Orinth-Sidekick/serve.sh
-   ```
-   Ready in ~5s, serves port 8321.
-2. **Open your project** (terminal 2):
-   ```sh
-   sidekick ~/dev/some-repo      # or: cd ~/dev/some-repo && sidekick
-   ```
-3. **Type a task.** Enter submits; **Shift+Enter** or **Alt+Enter** adds a newline;
-   paste multi-line text and it stays intact. `/help` lists keys, `/new` clears
-   context, `/tokens` shows context usage, ctrl-d quits.
-
-That's the whole "connection": whatever folder Sidekick starts in is the
-workspace — the model is told the path, and all file/bash tools work there.
-Optional: drop a `SIDEKICK.md` in a repo (build commands, layout, conventions)
-and it's added to the system prompt automatically.
-
-Reasoning streams dim, answers stream normal, tool calls print as `→ name arg`.
-A live token meter prints above each prompt (`ctx 12.3k / 105k tokens (12%)`), so
-you can see how close you are before old turns get dropped; it warns near the
-limit and prints a line whenever it trims. The count is the server's **real**
-token usage (requested via `stream_options.include_usage`) once you've sent a
-turn, and a `~` char-estimate before that. `/tokens` breaks usage down by role
-and shows the measured prompt/completion split. Conversation memory is **auto-sized
-to the server's window**: on startup Sidekick probes llama-server's `/props` and sets
-the budget to ~80% of its context (leaving headroom so a long reasoning turn isn't cut
-off), printed in the banner as `ctx 105k / 131k window`. Past that budget the oldest
-turns are dropped first — use `/new` to reset for a lean, focused chat. The server hard
-cap is set by `-c` in serve.sh (65536 at the default GPU wired limit, 131072 when it's
-raised — see serve.sh); `SIDEKICK_CTX_TOKENS` overrides the auto-sizing if you want a
-fixed budget.
-
-### Input
-
-A small raw-mode editor handles the prompt (stdlib only, no readline dependency):
-Enter submits, **Shift+Enter**/**Alt+Enter** insert a newline, and **bracketed
-paste** keeps multi-line pastes intact instead of firing on the first newline.
-Also: ↑/↓ recall previous prompts, ←/→/Home/End/Ctrl-A/Ctrl-E move, Ctrl-W deletes
-a word, Ctrl-U clears the line, Ctrl-C abandons it, Ctrl-D (empty) quits.
-
-Real **Shift+Enter** needs a terminal that speaks the kitty keyboard protocol
-(kitty, Ghostty, WezTerm, iTerm2 ≥3.5). Everywhere else — including Terminal.app —
-use **Alt+Enter** (Option+Enter, with "Use Option as Meta key" enabled). Paste and
-everything else work in any terminal.
-
-Prompts persist across sessions in `~/.sidekick_history` (JSON-per-line, last 1000
-recalled; slash commands aren't saved), so ↑ recalls what you typed yesterday.
-
-## How it works
-
-Sidekick sends your conversation plus five tool schemas to the local server and
-loops: the model streams either text (shown to you) or tool calls, which Sidekick
-executes and feeds back, until the model answers in plain text (max 40 steps).
-
-Tools: `read_file` (line-numbered, 400-line pages) · `write_file` ·
-`edit_file` (exact-unique-match replace, or a `start_line`/`end_line` range when an exact
-match is awkward) · `multi_edit` (several edits to one file in one atomic call) ·
-`bash` (configurable timeout, default 300s — covers ls, grep, git, running code and tests).
-
-History is trimmed oldest-first past the auto-sized budget; tool output is capped at 8k chars.
-
-## Config (env vars)
-
-| Var | Default | Purpose |
-|---|---|---|
-| `SIDEKICK_URL` | `http://localhost:8321/v1` | any OpenAI-compatible server (LM Studio: `http://localhost:1234/v1`) |
-| `SIDEKICK_CTX_TOKENS` | auto (~80% of server window) | history budget before old turns drop; set to override the auto-sizing |
-| `SIDEKICK_BASH_TIMEOUT` | `300` | per-command bash timeout (s); raise for slow builds/tests |
-| `SIDEKICK_MODEL` | `local` | model name sent to the server (llama-server ignores it) |
-| `SIDEKICK_HISTFILE` | `~/.sidekick_history` | where prompt history is stored (↑/↓ recall) |
-
-## Measured (M1 Max 32 GB, 2026-07-03)
-
-~38 tok/s generation, ~35 tok/s prompt processing at 16k context (f16 KV). Verified live:
-multi-step tool chaining, bug-find-and-fix with minimal edit, multi-file summarize.
-Re-measure at the new 32k / q8-KV setting — numbers above predate that change.
-
-## Privacy
-
-Inference is entirely on-device; `sidekick.py` talks only to localhost and has no
-telemetry. `serve.sh` loads the model from local disk (`-m`), so the server makes
-zero network requests. Git is restricted to read-only subcommands (status, log,
-diff, show, branch, blame, …) — commit/merge/checkout/push are blocked in the
-`bash` tool. Everything else in `bash` is unrestricted (trusted single user), so
-the agent *can* run networked commands like `curl` or `npm install` if you ask.
-
-## Testing
-
 ```sh
-./sidekick.py --selftest
+# 1. Get the model (~21 GB, SHA-256 verified against Hugging Face)
+mkdir -p ~/Models && curl -L -C - --retry 100 --retry-all-errors \
+  -o ~/Models/ornith-1.0-35b-Q4_K_M.gguf \
+  "https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B-GGUF/resolve/main/ornith-1.0-35b-Q4_K_M.gguf"
+
+# 2. Start the model (terminal 1, leave running — ready in ~5s, serves :8321)
+./serve.sh
+
+# 3. Point it at a repo (terminal 2)
+sidekick ~/dev/some-repo
 ```
 
-Drives the real agent loop against an in-process mock server (tool call →
-execution → final answer) plus edit/bash edge cases, the input editor (layout,
-key handling, paste/Shift+Enter parsing), and the token meter. No model needed,
-runs in ~1s.
+Whatever folder Sidekick starts in **is** the workspace. Drop a `SIDEKICK.md` in a repo (build
+commands, layout, conventions) and it's appended to the system prompt automatically.
 
-## Troubleshooting
+## Features
 
-- **Model won't load / out of memory** — close RAM-heavy apps, or raise the GPU
-  wired limit: `sudo sysctl iogpu.wired_limit_mb=26000`.
-- **"cannot reach http://localhost:8321"** — start `./serve.sh`.
-- **Downloading another model on a flaky connection** — llama.cpp's `-hf`
-  downloader gives up after 3 drops. Use resumable curl instead:
-  `curl -L -C - --retry 100 --retry-delay 5 --retry-all-errors --speed-limit 10240 --speed-time 30 -o file.gguf <resolve-url>`
-- **Fallback model** — Qwen3.6-27B Q4_K_M (higher SWE-bench, ~3× slower dense
-  decode): download its GGUF, point `serve.sh -m` at it, same everything else.
-- **Garbled tool calls** — make sure `--jinja` stayed in `serve.sh`; it selects
-  the chat template that formats Ornith's tool calls.
+### Context that sizes itself
+
+On startup Sidekick probes `llama-server`'s `/props` and sets its budget to **~80% of the server's
+real window**, leaving headroom so a long reasoning turn is never truncated. A live meter sits above
+every prompt:
+
+```
+ctx 12.3k / 105k tokens (12%)
+```
+
+Those counts are the server's **actual** usage (requested via `stream_options.include_usage`), not a
+character estimate. Past budget, the oldest turns drop first and it says so. `/tokens` breaks usage
+down by role and shows the measured prompt/completion split.
+
+### A real line editor, from the standard library
+
+No `readline` dependency:
+
+- **Enter** submits · **Shift+Enter** / **Alt+Enter** insert a newline
+- **Bracketed paste** — multi-line pastes stay intact instead of firing on the first newline
+- ↑/↓ history, persisted to `~/.sidekick_history` (last 1000, survives reboots)
+- ←/→/Home/End/Ctrl-A/Ctrl-E movement, Ctrl-W word-delete, Ctrl-U clear line, Ctrl-C abandon
+
+> Real **Shift+Enter** needs a terminal that speaks the kitty keyboard protocol (kitty, Ghostty,
+> WezTerm, iTerm2 ≥ 3.5). Everywhere else — including Terminal.app — use **Alt+Enter** (Option+Enter,
+> with "Use Option as Meta key" enabled). Paste works everywhere.
+
+### Context window scaling
+
+The default 64k works at the stock GPU wired limit. For up to the model's full 256k on a 32 GB Mac,
+raise the limit (per boot):
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=28672
+```
+
+`serve.sh` detects this and bumps `-c` automatically (65536 → 131072).
+
+### Readable output
+
+Reasoning streams dim, answers stream normal, tool calls print as `→ name arg`.
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `/help` | Key bindings and commands |
+| `/new` | Clear context for a lean, focused chat |
+| `/tokens` | Context usage, broken down by role |
+| `Ctrl-D` | Quit |
+
+## Why stdlib only
+
+A coding agent you drop onto a new machine shouldn't arrive with a dependency tree you have to
+audit. No framework, no package manager, no lockfile, no supply chain — just Python's standard
+library and a local model. That keeps it small enough to read end to end and trust, which matters
+more for a tool that edits your files than for most software.
+
+## Environment
+
+| Variable | Effect |
+|---|---|
+| `SIDEKICK_CTX_TOKENS` | Override auto-sizing with a fixed context budget |
+
+---
+
+<div align="center">
+<sub>Built by <a href="https://isaaclimb.com">Isaac Limb</a> · <a href="https://isaaclimb.com/projects/orinth-sidekick.html">Project writeup</a></sub>
+</div>
