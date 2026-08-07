@@ -99,14 +99,26 @@ No `readline` dependency:
 
 ### Context window scaling
 
-The default 64k works at the stock GPU wired limit. For up to the model's full 256k on a 32 GB Mac,
-raise the limit (per boot):
+`serve.sh` sizes `-c` from the memory actually available — the GPU wired cap (or ~75% of RAM when
+none is set) minus the model — and reports what it found:
+
+```
+serve.sh: cap=28672 MB, model=20186 MB, headroom=8486 MB -> -c 131072
+```
+
+A 64 GB Mac gets 131k with no setup. A 32 GB Mac gets 64k at the stock wired limit, and 131k if you
+raise it:
 
 ```sh
 sudo sysctl iogpu.wired_limit_mb=28672
 ```
 
-`serve.sh` detects this and bumps `-c` automatically (65536 → 131072).
+**That resets on every reboot.** If `serve.sh` reports a smaller context than you expect, that's
+why — it prints the exact command to re-raise it. If the model can't fit at all, it says so and
+exits instead of failing deep inside llama.cpp.
+
+> Raising the wired limit is the only thing that helps. Closing apps doesn't: the limit is a hard
+> cap on GPU memory no matter how much RAM is free.
 
 ### Readable output
 
@@ -120,6 +132,13 @@ Reasoning streams dim, answers stream normal, tool calls print as `→ name arg`
 | `/new` | Clear context for a lean, focused chat |
 | `/tokens` | Context usage, broken down by role |
 | `Ctrl-D` | Quit |
+
+## Tests
+
+```sh
+./sidekick.py --selftest   # agent loop, edits, input editor, token meter — no model needed, ~1s
+./test_serve.sh            # serve.sh's context picker at the measured boundaries
+```
 
 ## Why stdlib only
 
