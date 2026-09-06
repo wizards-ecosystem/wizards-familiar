@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wizards-familiar"
+description = "A coding agent that runs entirely on your machine. One stdlib-only Python file, no dependencies, no cloud."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Isaac Limb" }]
+keywords = ["coding-agent", "llm", "local-first", "llama-cpp", "cli"]
+dynamic = ["version"]
+
+# Intentionally empty, and checked by CI. The agent is standard library only.
+dependencies = []
+
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/wizards-ecosystem/wizards-familiar"
+Source = "https://github.com/wizards-ecosystem/wizards-familiar"
+Changelog = "https://github.com/wizards-ecosystem/wizards-familiar/blob/main/CHANGELOG.md"
+
+[project.scripts]
+familiar = "familiar:main"
+
+[tool.hatch.version]
+path = "familiar.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["familiar.py"]
+
+# serve.sh launches the model, so an install that omitted it would only be half the tool.
+[tool.hatch.build.targets.wheel.shared-scripts]
+"serve.sh" = "familiar-serve"
+
+[tool.hatch.build.targets.sdist]
+include = ["familiar.py", "serve.sh", "test_serve.sh", "README.md", "LICENSE", "CHANGELOG.md"]

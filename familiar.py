@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Sidekick — minimal local coding agent (stdlib only). See README.
+# The Wizard's Familiar — minimal local coding agent (stdlib only). See README.
 import json
 import os
 import re
@@ -17,29 +17,32 @@ try:
 except ImportError:  # non-unix; read_input() falls back to plain input()
     _RAW_OK = False
 
-BASE_URL = os.environ.get("SIDEKICK_URL", "http://localhost:8321/v1")
-MODEL = os.environ.get("SIDEKICK_MODEL", "local")
+__version__ = "0.1.0"
+
+BASE_URL = os.environ.get("FAMILIAR_URL", "http://localhost:8321/v1")
+MODEL = os.environ.get("FAMILIAR_MODEL", "local")
 CTX_CHARS = 55000 * 3  # ~3 chars/token; resolve_ctx_budget() sizes this to the server window at startup
 MAX_TOOL_OUTPUT = 8000
 MAX_STEPS = 40
-BASH_TIMEOUT = int(os.environ.get("SIDEKICK_BASH_TIMEOUT", "300"))  # seconds; raise for slow builds/tests
-HISTFILE = os.path.expanduser(os.environ.get("SIDEKICK_HISTFILE", "~/.sidekick_history"))
+BASH_TIMEOUT = int(os.environ.get("FAMILIAR_BASH_TIMEOUT", "300"))  # seconds; raise for slow builds/tests
+HISTFILE = os.path.expanduser(os.environ.get("FAMILIAR_HISTFILE", "~/.familiar_history"))
 
 LAST_USAGE = None  # real token counts from the server's last stream, if it reports them
 PLAN = False  # /plan: read-only mode — edit tools disabled, model proposes changes instead
 
 DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
 
-# `sidekick [dir]` — work on that repo; default is wherever you launched from
-if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
-    os.chdir(sys.argv[1])
+SYSTEM_PROMPT = ""  # built by init_workspace(), which needs the working directory first
 
-PROJECT_NOTES = ""
-if os.path.exists("SIDEKICK.md"):
-    with open("SIDEKICK.md", errors="replace") as f:
-        PROJECT_NOTES = "\n\nProject notes (from SIDEKICK.md):\n" + f.read()
 
-SYSTEM_PROMPT = f"""You are Sidekick, a coding agent running fully locally on the user's Mac.
+def build_system_prompt():
+    """Assemble the prompt for the current working directory, appending the repo's
+    FAMILIAR.md notes when it has them."""
+    notes = ""
+    if os.path.exists("FAMILIAR.md"):
+        with open("FAMILIAR.md", errors="replace") as f:
+            notes = "\n\nProject notes (from FAMILIAR.md):\n" + f.read()
+    return f"""You are the Wizard's Familiar, a coding agent running fully locally on the user's Mac.
 Working directory: {os.getcwd()}
 Platform: macOS (zsh available via the bash tool).
 
@@ -52,7 +55,15 @@ Use the tools to inspect and change code. Rules:
 - Use bash for everything else: grep, find, git, running code and tests — but read files with
   read_file, never `cat`, so unchanged re-reads are deduped and long files paginate.
 - Verify your work (run the code or a quick check) before declaring done.
-- Be concise. When the task is complete, reply with a short summary, no tool call.{PROJECT_NOTES}"""
+- Be concise. When the task is complete, reply with a short summary, no tool call.{notes}"""
+
+
+def init_workspace(argv):
+    # `familiar [dir]` — work on that repo; default is wherever you launched from
+    global SYSTEM_PROMPT
+    if len(argv) > 1 and not argv[1].startswith("-"):
+        os.chdir(argv[1])
+    SYSTEM_PROMPT = build_system_prompt()
 
 PLAN_SUFFIX = ("\n\n[PLAN MODE] You are read-only. The write/edit tools are disabled — do not try "
                "to change files. Explore with read_file and bash (read-only git only), then deliver "
@@ -106,7 +117,7 @@ TOOLS = [
 ]
 
 
-# ponytail: re-read guard — stub an unchanged re-read so a weak model can't spin on it;
+# re-read guard — stub an unchanged re-read so a weak model can't spin on it;
 # cleared on trim and /new so an evicted read can be fetched again.
 _READ_SEEN = {}  # realpath -> {"sig": (mtime_ns, size), "offsets": set()}
 
@@ -199,19 +210,19 @@ GIT_RO = {"status", "log", "diff", "show", "blame", "grep", "ls-files", "ls-remo
 
 
 def git_guard(command):
-    # ponytail: read-only git allowlist; non-git writes stay open (trusted single user)
+    # read-only git allowlist; non-git writes stay open (trusted single user)
     for m in re.finditer(r"\bgit\b((?:\s+(?:-C\s+\S+|--?[\w=./-]+))*)\s+([\w-]+)", command):
         sub = m.group(2)
         args = re.split(r"[;&|]", command[m.end():])[0]  # this invocation's args only
         mutating_branch = sub == "branch" and re.search(
             r"(^|\s)-[dDmMcCf]\b|--(delete|move|copy|force|set-upstream|unset-upstream|edit-description)", args)
         if sub not in GIT_RO or mutating_branch:
-            return (f"ERROR: 'git {sub}' is blocked — Sidekick may only run read-only "
+            return (f"ERROR: 'git {sub}' is blocked — Familiar may only run read-only "
                     "git commands (status, log, diff, show, branch, blame, ...)")
     return None
 
 
-# ponytail: route a bare `cat file` through read_file so the re-read guard dedupes it — a weak
+# route a bare `cat file` through read_file so the re-read guard dedupes it — a weak
 # model reaches for cat and re-dumps the same file into context. Pipes/redirects/flags/globs/vars
 # fall through to real bash; cat is legitimate inside a pipeline.
 _BARE_CAT = re.compile(r"^\s*cat\s+(?P<args>[^|&;<>`$()]+?)\s*$")
@@ -228,7 +239,7 @@ def bare_cat_paths(command):
 
 
 def tool_bash(command, **_):
-    # ponytail: git is read-only (guard above); everything else unsandboxed by design
+    # git is read-only (guard above); everything else unsandboxed by design
     paths = bare_cat_paths(command)
     if paths and all(os.path.isfile(p) for p in paths):
         return "\n".join(tool_read_file(p) for p in paths)
@@ -238,7 +249,7 @@ def tool_bash(command, **_):
     try:
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=BASH_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return f"ERROR: command timed out after {BASH_TIMEOUT}s (raise SIDEKICK_BASH_TIMEOUT)"
+        return f"ERROR: command timed out after {BASH_TIMEOUT}s (raise FAMILIAR_BASH_TIMEOUT)"
     out = (r.stdout + r.stderr).strip()
     return f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
 
@@ -326,9 +337,9 @@ def chat(messages):
 
 def resolve_ctx_budget():
     """Size the conversation budget to the server's real context window (~80%, leaving
-    headroom so a long reasoning turn isn't truncated). Explicit SIDEKICK_CTX_TOKENS wins;
+    headroom so a long reasoning turn isn't truncated). Explicit FAMILIAR_CTX_TOKENS wins;
     safe fallback if the server can't be probed. Returns (budget_tokens, server_ctx|None)."""
-    override = os.environ.get("SIDEKICK_CTX_TOKENS")
+    override = os.environ.get("FAMILIAR_CTX_TOKENS")
     if override:
         return int(override), None
     try:
@@ -351,7 +362,7 @@ def est_tokens(messages):
 
 
 def trim(messages):
-    # ponytail: crude char-count trim, summarize-on-trim if quality suffers. Keeps [0] system
+    # crude char-count trim, summarize-on-trim if quality suffers. Keeps [0] system
     # and [1] the task; drops tool results with their tool_calls message (orphans 400 the server).
     dropped = 0
     while context_chars(messages) > CTX_CHARS and len(messages) > 4:
@@ -376,7 +387,7 @@ def active_tools():
 
 def agent_turn(messages, user_input):
     messages.append({"role": "user", "content": user_input})
-    # ponytail: loop-breakers for a weak model — `edited`/`verified` gate the verify nudge
+    # loop-breakers for a weak model — `edited`/`verified` gate the verify nudge
     # (once), `prev_key` skips a tool call identical to the last one.
     edited = verified = nudged = False
     prev_key = None
@@ -419,7 +430,7 @@ def agent_turn(messages, user_input):
 
 
 # ── input editor (raw-mode multiline; see README) ───────────────────────────────
-# ponytail: full redraw per keystroke — O(buffer)/key, fine for prompt-sized text.
+# full redraw per keystroke — O(buffer)/key, fine for prompt-sized text.
 _ARROWS = {"A": ("up",), "B": ("down",), "C": ("right",), "D": ("left",),
            "H": ("home",), "F": ("end",)}
 
@@ -639,7 +650,7 @@ def _edit(prompt, history):
 
 
 def load_history():
-    # ponytail: JSON-per-line so multi-line prompts round-trip; keep last 1000 in memory
+    # JSON-per-line so multi-line prompts round-trip; keep last 1000 in memory
     try:
         with open(HISTFILE, errors="replace") as f:
             out = []
@@ -702,7 +713,7 @@ def cmd_tokens(messages):
     by_role = {}
     for m in messages:
         by_role[m["role"]] = by_role.get(m["role"], 0) + len(json.dumps(m)) // 3
-    print(f"{DIM}budget {budget // 1000}k tokens (SIDEKICK_CTX_TOKENS); server hard cap "
+    print(f"{DIM}budget {budget // 1000}k tokens (FAMILIAR_CTX_TOKENS); server hard cap "
           f"set by -c in serve.sh{RESET}")
     print(f"  estimate  {used:>6} tokens (~{pct:.0%} of budget) across {len(messages)} messages")
     if LAST_USAGE:
@@ -733,7 +744,7 @@ def repl():
     CTX_CHARS = budget * 3
     ctx_note = (f"ctx {budget // 1000}k / {server_ctx // 1000}k window" if server_ctx
                 else f"ctx {budget // 1000}k")
-    print(f"{BOLD}Sidekick{RESET} — local coding agent")
+    print(f"{BOLD}Familiar{RESET} — local coding agent")
     print(f"{DIM}server {BASE_URL} · cwd {os.getcwd()} · {ctx_note} · /help · ctrl-d quits{RESET}")
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     history = load_history()
@@ -772,7 +783,7 @@ def repl():
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:300]
             print(f"\nserver rejected the request ({e.code}): {body}\n"
-                  "likely context overflow — /new resets, or lower SIDEKICK_CTX_TOKENS")
+                  "likely context overflow — /new resets, or lower FAMILIAR_CTX_TOKENS")
         except urllib.error.URLError as e:
             print(f"\ncannot reach {BASE_URL} ({e.reason}) — start the model: ./serve.sh")
         except KeyboardInterrupt:
@@ -798,7 +809,7 @@ def selftest():
             if any(m["role"] == "tool" for m in body["messages"]):
                 chunks = [{"delta": {"content": "done: "}}, {"delta": {"content": "wrote probe"}}]
             else:
-                args = json.dumps({"path": probe, "content": "hello from sidekick"})
+                args = json.dumps({"path": probe, "content": "hello from familiar"})
                 chunks = [{"delta": {"tool_calls": [{"index": 0, "id": "call_1",
                           "function": {"name": "write_file", "arguments": args}}]}}]
             for c in chunks:
@@ -821,11 +832,11 @@ def selftest():
     BASE_URL = f"http://127.0.0.1:{srv.server_port}/v1"
 
     # context budget resolution: probe (80% of server n_ctx), env override, fallback
-    os.environ.pop("SIDEKICK_CTX_TOKENS", None)
+    os.environ.pop("FAMILIAR_CTX_TOKENS", None)
     assert resolve_ctx_budget() == (8000, 10000), "budget should be 80% of probed n_ctx"
-    os.environ["SIDEKICK_CTX_TOKENS"] = "12345"
+    os.environ["FAMILIAR_CTX_TOKENS"] = "12345"
     assert resolve_ctx_budget() == (12345, None), "env override should win"
-    os.environ.pop("SIDEKICK_CTX_TOKENS", None)
+    os.environ.pop("FAMILIAR_CTX_TOKENS", None)
     _saved_url, BASE_URL = BASE_URL, "http://127.0.0.1:1/v1"  # unreachable
     assert resolve_ctx_budget() == (55000, None), "fallback when server unreachable"
     BASE_URL = _saved_url
@@ -833,7 +844,7 @@ def selftest():
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     agent_turn(messages, "create the probe file")
     with open(probe) as f:
-        assert f.read() == "hello from sidekick", "tool execution failed"
+        assert f.read() == "hello from familiar", "tool execution failed"
     assert messages[-1]["content"] == "done: wrote probe", "final answer missing"
     assert any(m["role"] == "tool" for m in messages), "tool result not in transcript"
     assert any("ran nothing to check" in (m.get("content") or "")
@@ -994,8 +1005,17 @@ def selftest():
     print("selftest OK")
 
 
-if __name__ == "__main__":
-    if "--selftest" in sys.argv:
+def main(argv=None):
+    argv = sys.argv if argv is None else argv
+    if "--version" in argv:
+        print(f"familiar {__version__}")
+        return
+    init_workspace(argv)
+    if "--selftest" in argv:
         selftest()
     else:
         repl()
+
+
+if __name__ == "__main__":
+    main()

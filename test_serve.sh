@@ -1,5 +1,5 @@
 #!/bin/sh
-# ponytail: one check — the ctx picker at the boundaries we actually measured on an M1 Max 32 GB.
+# one check — the ctx picker at the boundaries we actually measured on an M1 Max 32 GB.
 cd "$(dirname "$0")" || exit 1
 fail=0
 

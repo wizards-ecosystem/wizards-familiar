@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Familiar targets macOS on Apple Silicon, so the tests run on the platform it ships to.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Agent selftest
+        run: ./familiar.py --selftest
+
+      - name: serve.sh context picker
+        run: ./test_serve.sh
+
+  package:
+    # The install path the README documents: a wheel that puts `familiar` on PATH.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Build and install
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel
+          python -m pip install dist/*.whl
+
+      - name: Console scripts are installed and runnable
+        run: |
+          familiar --version
+          familiar --selftest
+          command -v familiar-serve
+
+      - name: The dependency list is still empty
+        run: |
+          deps=$(python -c "import importlib.metadata as m; print(m.requires('wizards-familiar') or [])")
+          echo "declared dependencies: $deps"
+          [ "$deps" = "[]" ] || { echo "wizards-familiar must stay dependency-free"; exit 1; }

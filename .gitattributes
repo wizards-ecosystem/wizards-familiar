@@ -1,0 +1,3 @@
+# The scripts are run on macOS. Keep LF in the repository and on checkout.
+* text=auto eol=lf
+*.png binary

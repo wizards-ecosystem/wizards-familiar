@@ -1,6 +1,6 @@
 #!/bin/sh
 # Local Ornith-1.0-35B server. Context is sized from GPU-wired headroom — see README.
-MODEL="${SIDEKICK_MODEL_PATH:-$HOME/Models/ornith-1.0-35b-Q4_K_M.gguf}"
+MODEL="${FAMILIAR_MODEL_PATH:-$HOME/Models/ornith-1.0-35b-Q4_K_M.gguf}"
 
 WIRED=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
 if [ "${WIRED:-0}" -gt 0 ]; then
@@ -12,7 +12,7 @@ MODEL_MB=${MODEL_MB:-$(( $(stat -f%z "$MODEL") / 1048576 ))}
 RAM_MB=${RAM_MB:-$(( $(sysctl -n hw.memsize) / 1048576 ))}
 HEADROOM=$(( CAP - MODEL_MB ))
 
-# ponytail: ~50 MB of KV per 1k ctx at q4_0, measured on an M1 Max 32 GB.
+# ~50 MB of KV per 1k ctx at q4_0, measured on an M1 Max 32 GB.
 # Re-measure if you change quant, KV type, or model. Caps at 131072 (highest verified).
 CTX=0
 for C in 131072 98304 65536 32768 16384; do
