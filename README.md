@@ -1,8 +1,9 @@
-<p align="center">
-  <img src="docs/assets/the-wizards.svg" alt="The Wizard's" width="220">
-</p>
-
-# The Wizard's Familiar
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/familiar-logo-dark.svg">
+    <img src="docs/assets/familiar-logo.svg" alt="The Wizard's Familiar" width="420">
+  </picture>
+</h1>
 
 **A coding agent that runs entirely on your machine. One file, no dependencies, no cloud.**
 
