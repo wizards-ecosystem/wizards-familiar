@@ -1,4 +1,4 @@
-<h1>
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/familiar-logo-dark.svg">
     <img src="docs/assets/familiar-logo.svg" alt="The Wizard's Familiar" width="420">
