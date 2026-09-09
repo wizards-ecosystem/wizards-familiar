@@ -1,3 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-labelledby="title"><title id="title">The Wizard's Familiar mark</title><style>@media(prefers-color-scheme:dark){[fill="#272522"]{fill:#F7F6F2}[fill="#52634A"]{fill:#BACBAD}[stroke="#272522"]{stroke:#F7F6F2}[stroke="#52634A"]{stroke:#BACBAD}}</style>
-    <path d="M16 29 15 12l14 10h6l14-10-1 17c6 18-5 25-16 25S10 47 16 29Z" fill="none" stroke="#272522" stroke-width="2.8" stroke-linejoin="round"/>
-    <path d="m21 34 5 2m17-2-5 2m-9 7 3 3 3-3M9 40l11 2m24 0 11-2" fill="none" stroke="#52634A" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title"><title id="title">The Wizard's Familiar mark</title><style>:root{--ink:#2D3433;--paper:#F1E9D5;--gold:#BAA477;--wood:#89715A;--metal:#A1AEAD;--wax:#AA5134;--clear:none;--accent:#647453}@media(prefers-color-scheme:dark){:root{--ink:#3E4944;--paper:#F0E8D1;--gold:#C9B47E;--wood:#A38365;--metal:#9CB5B4;--wax:#CB7752;--clear:none;--accent:#BED1AD}}</style>
+    <path d="M28 52 23 12C39 13 47 26 53 34c9-2 15-1 22 1 8-14 18-21 30-23l-3 42c16 31-1 62-37 64-39 1-56-33-37-66Z" fill="var(--accent)" stroke="var(--ink)" stroke-width="3.5" stroke-linejoin="round"/>
+    <path d="m32 26 5 25 10-12Zm64 0-16 15 12 10Z" fill="var(--wood)"/>
+    <path d="M40 65c7-5 15-3 21 3-6 8-16 7-21-3m34 3c6-6 14-8 21-3-5 10-15 11-21 3" fill="var(--paper)"/>
+    <path d="m50 64 2 9m31-10-2 10" stroke="var(--ink)" stroke-width="3"/>
+    <path d="m59 85 9-3 7 4-8 7Zm8 9c-1 8-8 8-12 4m12-4c2 8 9 7 12 2" fill="var(--ink)" stroke="var(--ink)" stroke-width="2" stroke-linecap="round"/>
+    <path d="m14 77 32 7M12 91l32-1m45-6 27-7m-28 14 27 4M53 41l9 12 8-12" fill="none" stroke="var(--ink)" stroke-width="3" stroke-linecap="round"/></svg>
