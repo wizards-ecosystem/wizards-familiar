@@ -1,13 +1,13 @@
-# Handoff: ripwire as an optional retrieval tool, 2026-09-06
+# ripwire: an optional retrieval tool
 
 Status: **assessment only. Nothing installed, nothing changed, nothing decided.** This file
 is the whole output. Every claim about `familiar.py` below was checked by opening the file
 at the time of writing; every claim about ripwire cites a path at the pin in section 1.
 
-Unlike [HANDOFF-BHAVAI.md](HANDOFF-BHAVAI.md), **this is not a list of techniques to
+Unlike [the BhavAI assessment](bhavai.md), **this is not a list of techniques to
 reimplement**. Nothing here is copied or adapted. ripwire is an Apache-2.0 external binary,
 and the only question is whether Familiar should invoke one it does not ship. That question
-runs straight into the first row of the constraints table in [AGENTS.md](../AGENTS.md), so
+runs straight into the first row of the constraints table in [AGENTS.md](../../AGENTS.md), so
 section 3 is the whole decision and sections 4-6 only matter if section 3 goes the right way.
 
 ## 1. Where this came from
@@ -36,19 +36,19 @@ the four**, and the reasons are specific to this codebase rather than general en
 Familiar's only supported platform is macOS on Apple Silicon. There is no porting question.
 
 **The problem it attacks is the one Familiar already spends code fighting.**
-[familiar.py:24](../familiar.py#L24) sets `CTX_CHARS = 55000 * 3`, sized to the server's real
-window at startup by `resolve_ctx_budget()` ([familiar.py:338](../familiar.py#L338)). When
-that budget fills, [familiar.py:368](../familiar.py#L368) **drops the oldest messages** and
+[familiar.py:24](../../familiar.py#L24) sets `CTX_CHARS = 55000 * 3`, sized to the server's real
+window at startup by `resolve_ctx_budget()` ([familiar.py:338](../../familiar.py#L338)). When
+that budget fills, [familiar.py:368](../../familiar.py#L368) **drops the oldest messages** and
 prints `context full — dropped N old message(s)`. Familiar does not summarise or compact; it
 forgets. Every token spent on an exploratory grep-and-read pass is bought by discarding
 earlier turns of the same task.
 
 The codebase is already explicit that this is the failure mode. The comment at
-[familiar.py:224-226](../familiar.py#L224-L226) reads *"a weak model reaches for cat and
+[familiar.py:224-226](../../familiar.py#L224-L226) reads *"a weak model reaches for cat and
 re-dumps the same file into context"*, and `bare_cat_paths()` exists for no other reason than
 to route a bare `cat` back through `read_file` so `_READ_SEEN` can dedupe it. The system
 prompt spends a bullet on the same thing: *"You already have what you've read — don't re-read
-a file that hasn't changed"* ([familiar.py:49](../familiar.py#L49)).
+a file that hasn't changed"* ([familiar.py:49](../../familiar.py#L49)).
 
 AGENTS.md's "Working on the loop-breakers" section names the re-read guard, the
 consecutive-duplicate breaker, the bare-`cat` routing and the rest, and says plainly: *"They
@@ -72,8 +72,8 @@ different answers.
 **The letter is not violated.** The enforced check is on `pyproject.toml`'s dependency list
 staying empty, and ripwire is not a Python package. Familiar already invokes external binaries
 it does not declare and could not function without: `git` throughout `git_guard`
-([familiar.py:218](../familiar.py#L218)), and the system prompt tells the model to use `bash`
-for *"grep, find, git, running code and tests"* ([familiar.py:53-54](../familiar.py#L53-L54)).
+([familiar.py:218](../../familiar.py#L218)), and the system prompt tells the model to use `bash`
+for *"grep, find, git, running code and tests"* ([familiar.py:53-54](../../familiar.py#L53-L54)).
 Those are all undeclared host binaries. CI would stay green.
 
 **The spirit is engaged, and honestly so.** `grep`, `find` and `git` are on every developer
@@ -100,9 +100,9 @@ but that is an argument, not a ruling.
 Two seams, and they differ in cost by a lot.
 
 **Seam A — per-repo `FAMILIAR.md`, zero code change.**
-`build_system_prompt()` ([familiar.py:36-56](../familiar.py#L36-L56)) appends the working
+`build_system_prompt()` ([familiar.py:36-56](../../familiar.py#L36-L56)) appends the working
 directory's `FAMILIAR.md` to the system prompt when one exists
-([familiar.py:42-44](../familiar.py#L42-L44)). A user with ripwire installed adds a few lines
+([familiar.py:42-44](../../familiar.py#L42-L44)). A user with ripwire installed adds a few lines
 to the `FAMILIAR.md` of a repo they work on, and the agent starts reaching for it there.
 
 **No change to `familiar.py`, therefore no behaviour change, therefore no selftest case
@@ -112,7 +112,7 @@ the *working directory* — it is the target repository's notes, not Familiar's 
 ships.
 
 **Seam B — teach it in the base prompt, which is a real change.**
-Adding ripwire to the tool bullet at [familiar.py:53-54](../familiar.py#L53-L54) makes it part
+Adding ripwire to the tool bullet at [familiar.py:53-54](../../familiar.py#L53-L54) makes it part
 of the product. That needs presence detection (`shutil.which`, stdlib) so the prompt does not
 instruct the model to run a binary that is not there — a model told to use a missing tool will
 burn steps discovering that, which is the exact waste this is meant to prevent.
@@ -184,4 +184,4 @@ read at that date against the 1,021-line file. The clone is gitignored inside
 four-target assessment that this file is the Familiar half of. Bella has its own half in
 `bella-services/docs/HANDOFF_2026-09-06_RIPWIRE.md`; Pick and Conclave were declined there.
 
-Not added to any documentation index: `docs/HANDOFF-BHAVAI.md` is not indexed either.
+Indexed in [the assessment register](README.md), alongside the BhavAI review.

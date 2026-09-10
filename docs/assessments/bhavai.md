@@ -1,4 +1,4 @@
-# Handoff: five changes taken from a BhavAI review, 2026-09-06
+# BhavAI: five changes worth taking
 
 Status: **reviewed, nothing implemented.** This file is the whole output of the review. Each
 item below was checked against `familiar.py` at the time of writing, so the gaps described are
@@ -25,15 +25,15 @@ contradiction is a reason for caution rather than a loophole. Nothing below is a
 is a technique described so it can be written from scratch, which is how it has to be done.
 
 Every item is stdlib-only and none of them splits `familiar.py`, so the constraints in
-[AGENTS.md](../AGENTS.md) hold. Per that file, a behaviour change without a matching case in
+[AGENTS.md](../../AGENTS.md) hold. Per that file, a behaviour change without a matching case in
 `selftest()` is incomplete, so each item names the case it needs.
 
 ---
 
 ## 1. Widen the duplicate-call breaker to a window
 
-**The gap is real.** `prev_key` in `agent_turn` ([familiar.py:392](../familiar.py#L392),
-compared at [familiar.py:414](../familiar.py#L414)) holds exactly one key and catches only a
+**The gap is real.** `prev_key` in `agent_turn` ([familiar.py:392](../../familiar.py#L392),
+compared at [familiar.py:414](../../familiar.py#L414)) holds exactly one key and catches only a
 back-to-back repeat. A model that alternates two useless calls — read A, read B, read A, read B —
 never trips it and burns the full `MAX_STEPS`. That is the most likely real loop for a 35B, and
 it is currently invisible.
@@ -46,7 +46,7 @@ Two changes, both small:
 - **Canonicalise the key.** The key today is the raw `arguments` string from the model, so two
   calls differing only in key order or whitespace are the same call and compare unequal. Parse
   and re-serialise with `json.dumps(args, sort_keys=True)` instead. The parsed `args` is already
-  in hand at [familiar.py:409](../familiar.py#L409), so this costs nothing.
+  in hand at [familiar.py:409](../../familiar.py#L409), so this costs nothing.
 
 Keep the existing behaviour of not executing the tool and feeding a note back as the result.
 
@@ -56,12 +56,12 @@ genuinely needed again it must justify it in its `thought` field first. Ours say
 "changes nothing", which is a statement rather than an instruction and leaves no legitimate route
 to a repeat. Give the model somewhere to go.
 
-**Selftest:** extend the duplicate-breaker case at [familiar.py:853](../familiar.py#L853) with an
+**Selftest:** extend the duplicate-breaker case at [familiar.py:853](../../familiar.py#L853) with an
 A-B-A-B script that must break, plus a case pinning that reordered JSON keys compare equal.
 
 ## 2. Continue a completion that stopped on `max_tokens`
 
-**The gap is real.** `chat()` reads `choices[0].delta` ([familiar.py:302](../familiar.py#L302))
+**The gap is real.** `chat()` reads `choices[0].delta` ([familiar.py:302](../../familiar.py#L302))
 and never looks at `finish_reason`. A completion cut off at the output cap is returned as though
 it were complete, and the loop proceeds on a truncated tool call or a half-written summary. On a
 local 35B with a modest output budget that is routine, not an edge case.
@@ -84,7 +84,7 @@ the second, asserting the fragments are joined and the tool call parses.
 
 ## 3. Keep the tail when truncating tool output
 
-**The gap is real.** [familiar.py:270](../familiar.py#L270) truncates head-only —
+**The gap is real.** [familiar.py:270](../../familiar.py#L270) truncates head-only —
 `result[:MAX_TOOL_OUTPUT]`, with `MAX_TOOL_OUTPUT = 8000`. For the outputs that matter most, a
 failing test run or a stack trace or a long build, the verdict is at the end and the invocation
 noise is at the start. Head-only truncation therefore discards the answer and keeps the preamble.
@@ -124,13 +124,13 @@ useless on a real tree.
 
 ## 5. Stage edits so `git diff HEAD` is always the agent's changeset
 
-[README.md](../README.md) tells the operator to run Familiar on a clean working tree so every
+[README.md](../../README.md) tells the operator to run Familiar on a clean working tree so every
 edit is reviewable with `git diff`. That is the only real recovery story we offer, and it depends
 on the human remembering. BhavAI makes it mechanical: after each successful write it runs
 `git add` on that file, best-effort and silent. Staged is then the agent's work, unstaged is
 yours, and `git diff HEAD` is exactly what the agent did across the session.
 
-This one needs a decision rather than an implementation. [SECURITY.md](../SECURITY.md) and the
+This one needs a decision rather than an implementation. [SECURITY.md](../../SECURITY.md) and the
 git guard restrict git to a read-only allowlist, so `git add` is a deliberate carve-out in the
 one control we actually enforce. The carve-out has to be narrow: our own call on a specific path,
 never reachable through the model's `bash`. Worth doing only if that boundary stays clean.
