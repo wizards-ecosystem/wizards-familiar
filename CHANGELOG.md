@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Preserve the head and tail of long tool output; reject invalid Python writes.
+- Detect alternating and canonical-equivalent tool loops. Continue capped replies
+  within three requests and discard incomplete tool arguments.
+
+- Make the read-only Git selftests accept commit messages containing "blocked".
+  They now check that the command reached the shell, so repository history cannot
+  produce a false guard failure. Runtime command policy is unchanged.
+
 ## 0.1.0
 
 First release under The Wizard's Ecosystem. The agent itself is unchanged from the

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # The Wizard's Familiar — minimal local coding agent (stdlib only). See README.
+import ast
 import json
 import os
 import re
@@ -152,7 +153,19 @@ def tool_read_file(path, offset=1, **_):
     return body or "[empty file]"
 
 
+def python_edit_error(path, content):
+    if str(path).endswith(".py"):
+        try:
+            ast.parse(content, filename=str(path))
+        except (SyntaxError, ValueError) as e:
+            return f"ERROR: invalid Python (nothing written): {e}"
+    return None
+
+
 def tool_write_file(path, content, **_):
+    error = python_edit_error(path, content)
+    if error:
+        return error
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -172,8 +185,12 @@ def tool_edit_file(path, old=None, new="", start_line=None, end_line=None, **_):
             return f"ERROR: start_line {start_line} out of range (file has {len(lines)} lines)"
         repl = [] if new == "" else [new if new.endswith("\n") else new + "\n"]
         lines[s:e] = repl
+        content = "".join(lines)
+        error = python_edit_error(path, content)
+        if error:
+            return error
         with open(path, "w") as f:
-            f.write("".join(lines))
+            f.write(content)
         return f"replaced lines {start_line}-{e} in {path}"
     if not old:
         return "ERROR: provide 'old' (exact match) or 'start_line'/'end_line'"
@@ -182,8 +199,12 @@ def tool_edit_file(path, old=None, new="", start_line=None, end_line=None, **_):
         return "ERROR: old string not found in file"
     if n > 1:
         return f"ERROR: old string appears {n} times, add context to make it unique"
+    content = text.replace(old, new, 1)
+    error = python_edit_error(path, content)
+    if error:
+        return error
     with open(path, "w") as f:
-        f.write(text.replace(old, new, 1))
+        f.write(content)
     return f"edited {path}"
 
 
@@ -199,6 +220,9 @@ def tool_multi_edit(path, edits, **_):
         if n > 1:
             return f"ERROR: edit {i}: old string appears {n} times, add context (nothing written)"
         text = text.replace(old, e["new"], 1)
+    error = python_edit_error(path, text)
+    if error:
+        return error
     with open(path, "w") as f:
         f.write(text)
     return f"applied {len(edits)} edits to {path}"
@@ -267,14 +291,16 @@ def run_tool(name, args):
     except Exception as e:  # bad path, bad args — feed the error back to the model
         result = f"ERROR: {type(e).__name__}: {e}"
     if len(result) > MAX_TOOL_OUTPUT:
-        result = result[:MAX_TOOL_OUTPUT] + "\n[output truncated]"
+        keep = (MAX_TOOL_OUTPUT - 80) // 2
+        omitted = len(result) - keep * 2
+        result = result[:keep] + f"\n[output truncated: {omitted} characters omitted]\n" + result[-keep:]
     return result
 
 
-def chat(messages):
+def stream_completion(messages, tools=None):
     """Stream one completion. Prints content live, returns the assistant message."""
     global LAST_USAGE
-    payload = {"model": MODEL, "messages": messages, "tools": active_tools(), "stream": True,
+    payload = {"model": MODEL, "messages": messages, "tools": active_tools() if tools is None else tools, "stream": True,
                "stream_options": {"include_usage": True}}  # ask for real token counts
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",
@@ -282,7 +308,7 @@ def chat(messages):
         headers={"Content-Type": "application/json"})
     resp = urllib.request.urlopen(req, timeout=600)
 
-    content, reasoning, tool_calls = "", False, {}
+    content, reasoning, tool_calls, finish = "", False, {}, None
     for raw in resp:
         line = raw.decode("utf-8", errors="replace").strip()
         if not line.startswith("data: ") or line == "data: [DONE]":
@@ -299,6 +325,7 @@ def chat(messages):
         choices = obj.get("choices") or []
         if not choices:  # usage-only / keep-alive frame has no choices
             continue
+        finish = choices[0].get("finish_reason") or finish
         delta = choices[0].get("delta", {})
         r = delta.get("reasoning_content")
         if r:  # think-blocks: show dim so slow local gen isn't a silent wait
@@ -332,7 +359,44 @@ def chat(messages):
             {"id": t["id"] or f"call_{i}", "type": "function",
              "function": {"name": t["name"], "arguments": t["arguments"]}}
             for i, t in sorted(tool_calls.items())]
-    return msg
+    resp.close()
+    return msg, finish
+
+
+def chat(messages):
+    """Finish capped replies within three requests; never execute partial arguments."""
+    msg, finish = stream_completion(messages)
+    calls = msg.get("tool_calls", [])
+    if finish not in ("length", "max_tokens"):
+        return msg
+    if len(calls) > 1:
+        return {"role": "assistant", "content": "[completion truncated: multiple tool calls discarded; retry separately]"}
+    fragment = calls[0]["function"]["arguments"] if calls else (msg["content"] or "")
+    for _ in range(2):
+        instruction = ("Continue the unfinished JSON arguments exactly where they stopped. "
+                       "Output only the remaining JSON, with no fence, repetition or tool call."
+                       if calls else "Continue exactly where you stopped. Output only the continuation; do not repeat it.")
+        more, finish = stream_completion(messages + [
+            {"role": "assistant", "content": fragment},
+            {"role": "user", "content": instruction}], tools=[])
+        if more.get("tool_calls"):
+            break
+        fragment += more["content"] or ""
+        if finish not in ("length", "max_tokens"):
+            if calls:
+                try:
+                    args = json.loads(fragment)
+                    if not isinstance(args, dict):
+                        raise ValueError("arguments must be an object")
+                except (ValueError, TypeError):
+                    break
+                calls[0]["function"]["arguments"] = fragment
+            else:
+                msg["content"] = fragment
+            return msg
+    return {"role": "assistant", "content":
+            ("[completion truncated: tool arguments discarded; retry the call]" if calls else
+             fragment + "\n[completion still truncated after three requests]")}
 
 
 def resolve_ctx_budget():
@@ -388,9 +452,9 @@ def active_tools():
 def agent_turn(messages, user_input):
     messages.append({"role": "user", "content": user_input})
     # loop-breakers for a weak model — `edited`/`verified` gate the verify nudge
-    # (once), `prev_key` skips a tool call identical to the last one.
+    # (once), `recent_keys` catches consecutive and alternating repeated calls.
     edited = verified = nudged = False
-    prev_key = None
+    recent_keys = []
     for _ in range(MAX_STEPS):
         trim(messages)
         msg = chat(messages)
@@ -410,9 +474,9 @@ def agent_turn(messages, user_input):
             except json.JSONDecodeError as e:
                 result = f"ERROR: malformed tool arguments: {e}"
             else:
-                key = (name, tc["function"]["arguments"] or "")
-                if key == prev_key:  # identical back-to-back call — a loop, don't rerun it
-                    result = ("[skipped: identical to your previous call. Repeating it changes "
+                key = (name, json.dumps(args, sort_keys=True))
+                if key in recent_keys:  # identical back-to-back call — a loop, don't rerun it
+                    result = ("[skipped: identical to a recent call. Reuse its earlier observation. Repeating it changes "
                               "nothing — make a different change, verify, or stop and summarize.]")
                 else:
                     preview = args.get("command") or args.get("path") or ""
@@ -420,9 +484,13 @@ def agent_turn(messages, user_input):
                     result = run_tool(name, args)
                     if name in MUTATORS and not result.startswith("ERROR"):
                         edited, verified = True, False
+                        # Changed files justify another verification, but do not
+                        # forget repeated writes that alternate between two paths.
+                        recent_keys = [k for k in recent_keys if k[0] in MUTATORS]
                     elif name == "bash" and edited:
                         verified = True
-                prev_key = key
+                recent_keys.append(key)
+                recent_keys = recent_keys[-4:]
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
     messages.append({"role": "user", "content":
                      "Step limit reached. Summarize progress and stop."})
@@ -888,6 +956,75 @@ def selftest():
     assert LAST_USAGE and LAST_USAGE["prompt_tokens"] == 100, "server usage not captured"
     assert not format_meter(messages).startswith("ctx ~"), "meter should use measured tokens"
 
+    # Alternating calls and equivalent JSON keys cannot bypass the breaker.
+    from unittest.mock import patch
+    import io
+
+    def call(arguments):
+        return {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "test", "function": {"name": "read_file", "arguments": arguments}}]}
+
+    done = {"role": "assistant", "content": "done"}
+    for script in ([call('{"path":"A"}'), call('{"path":"B"}'),
+                    call('{"path":"A"}'), call('{"path":"B"}'), done],
+                   [call('{"path":"A", "offset":1}'),
+                    call('{"offset": 1,"path": "A"}'), done]):
+        with patch.dict(globals(), chat=lambda m, it=iter(script): next(it)):
+            with patch.dict(globals(), run_tool=lambda name, args: "read " + args["path"]):
+                transcript = [{"role": "system", "content": "s"}]
+                agent_turn(transcript, "read")
+        results = [m["content"] for m in transcript if m["role"] == "tool"]
+        expected = 2 if len(script) == 5 else 1
+        assert sum(r.startswith("read ") for r in results) == expected
+        assert any("skipped: identical" in r for r in results)
+
+    def frame(delta, finish=None):
+        return ("data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}) + "\n\n").encode()
+
+    partial = {"tool_calls": [{"index": 0, "id": "call_test", "function": {
+        "name": "write_file", "arguments": '{"path":"a.txt","content":"hel'}}]}
+    with patch.object(urllib.request, "urlopen", side_effect=[
+            io.BytesIO(frame(partial, "length")),
+            io.BytesIO(frame({"content": 'lo"}'}, "stop"))]) as opener:
+        msg = chat([{"role": "user", "content": "write"}])
+        assert json.loads(msg["tool_calls"][0]["function"]["arguments"])["content"] == "hello"
+        assert json.loads(opener.call_args[0][0].data)["tools"] == []
+    for ending in (frame({"content": "bad JSON"}, "stop"), frame({"content": "x"}, "length")):
+        with patch.object(urllib.request, "urlopen", side_effect=[
+                io.BytesIO(frame(partial, "length")), io.BytesIO(ending), io.BytesIO(ending)]) as opener:
+            msg = chat([{"role": "user", "content": "write"}])
+            assert not msg.get("tool_calls"), "invalid or still-capped arguments must not execute"
+            assert opener.call_count <= 3
+
+    large = "HEAD\n" + "noise\n" * MAX_TOOL_OUTPUT + "TAIL failure\n"
+    with patch.dict(TOOL_IMPL, bash=lambda **kwargs: large):
+        excerpt = run_tool("bash", {})
+    assert excerpt.startswith("HEAD") and excerpt.endswith("TAIL failure\n")
+    assert "characters omitted" in excerpt and len(excerpt) <= MAX_TOOL_OUTPUT
+
+    # Alternating writes must still break after verification history is reset.
+    writes = []
+    for target in (probe, probe + "-other", probe):
+        msg = call(json.dumps({"path": target, "content": "same"}))
+        msg["tool_calls"][0]["function"]["name"] = "write_file"
+        writes.append(msg)
+    verify = call('{"command":"exit 0"}')
+    verify["tool_calls"][0]["function"]["name"] = "bash"
+    with patch.dict(globals(), chat=lambda m, it=iter(writes + [verify, done]): next(it)):
+        transcript = [{"role": "system", "content": "s"}]
+        agent_turn(transcript, "write")
+    assert sum("skipped: identical" in (m.get("content") or "") for m in transcript) == 1
+
+    pyprobe = probe + ".py"
+    tool_write_file(pyprobe, "x = 1\n")
+    before = open(pyprobe, "rb").read()
+    for edit in (lambda: tool_edit_file(pyprobe, "x = 1", "x = ("),
+                 lambda: tool_edit_file(pyprobe, new="x = (", start_line=1),
+                 lambda: tool_multi_edit(pyprobe, [{"old": "1", "new": "("}]),
+                 lambda: tool_write_file(pyprobe, "x = (")):
+        assert edit().startswith("ERROR: invalid Python")
+        assert open(pyprobe, "rb").read() == before, "invalid Python changed the original bytes"
+
     saved, CTX_CHARS = CTX_CHARS, 50
     msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "the task"},
             {"role": "assistant", "content": None, "tool_calls": [{"id": "t1"}]},
@@ -927,8 +1064,10 @@ def selftest():
     assert "blocked" in tool_bash("git checkout main")
     assert "blocked" in tool_bash("git branch -D old")
     assert "blocked" in tool_bash("git -C /tmp push origin main")
-    assert "blocked" not in tool_bash("git log -1")
-    assert "blocked" not in tool_bash("git -C /tmp status && git branch --show-current")
+    # Read-only output can contain "blocked", including a real commit message.
+    # The exit prefix proves the command reached the shell instead of the guard.
+    assert tool_bash("git log -1").startswith("exit ")
+    assert tool_bash("git -C /tmp status && git branch --show-current").startswith("exit ")
     assert "truncated" not in tool_read_file(probe)
 
     # plan mode: mutators vanish from the tool list and are hard-blocked at execution

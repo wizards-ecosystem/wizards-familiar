@@ -1,8 +1,13 @@
 # BhavAI: five changes worth taking
 
-Status: **reviewed, nothing implemented.** This file is the whole output of the review. Each
-item below was checked against `familiar.py` at the time of writing, so the gaps described are
-real rather than assumed, but no code has been changed.
+Status: **closed 2026-10-07.** Items 1-4 were implemented from scratch and covered by
+`selftest()`: canonical duplicate-call history, bounded completion continuation, head/tail
+output excerpts, and Python syntax validation before writes. Capped or invalid tool
+arguments are discarded. Item 5 is declined: automatic staging changes the index without
+a review step and conflicts with the existing read-only Git policy.
+
+The original dated assessment follows as evidence; its line numbers describe the
+reviewed revision, not the current source. No upstream code was copied.
 
 ## Where this came from
 
@@ -164,7 +169,7 @@ its chunked-write tool, an artefact of a 4k output cap that item 2 answers bette
 FastAPI settings backend, which is dead code upstream — `fastapi` is not a declared dependency
 there.
 
-## Suggested order
+## Original suggested order
 
 Items 3 and 1 first: both are small, both are verified gaps, and neither needs a design decision.
 Item 2 next, as it needs care in the streaming loop. Item 4 after that. Item 5 only if the git

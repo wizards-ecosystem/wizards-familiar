@@ -43,7 +43,7 @@ case in `selftest()` is incomplete.
 ## Working on the loop-breakers
 
 Several pieces exist because a 35B local model is weaker than a hosted one and gets
-stuck: the re-read guard (`_READ_SEEN`), the consecutive-duplicate breaker (`prev_key`
+stuck: the re-read guard (`_READ_SEEN`), the duplicate-call window (`recent_keys`
 in `agent_turn`), the verify-after-edit nudge, bare `cat` routed through `read_file`,
 and directory reads listed rather than errored. They look like workarounds because they
 are. Each has a selftest case pinning the behavior it was written for. Do not remove one

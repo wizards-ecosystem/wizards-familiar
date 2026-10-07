@@ -1,0 +1,9 @@
+# The Wizard's Familiar
+
+> A stdlib-only local coding agent for macOS on Apple Silicon.
+
+## Documentation
+
+- [README](https://github.com/wizards-ecosystem/wizards-familiar/blob/main/README.md)
+- [Security policy](https://github.com/wizards-ecosystem/wizards-familiar/blob/main/SECURITY.md)
+- [Working standards](https://github.com/wizards-ecosystem/wizards-familiar/blob/main/AGENTS.md)

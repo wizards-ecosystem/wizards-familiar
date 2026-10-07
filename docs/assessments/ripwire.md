@@ -1,8 +1,10 @@
 # ripwire: an optional retrieval tool
 
-Status: **assessment only. Nothing installed, nothing changed, nothing decided.** This file
-is the whole output. Every claim about `familiar.py` below was checked by opening the file
-at the time of writing; every claim about ripwire cites a path at the pin in section 1.
+Status: **closed without product integration, 2026-10-07.** Familiar keeps its
+stdlib-only, one-file product. No optional binary is installed, auto-detected or added
+to the base prompt. The existing per-project `FAMILIAR.md` mechanism is sufficient for
+operators who independently choose such tools. Seam B has no measured Familiar result
+and is not adopted. The dated assessment below is retained as evidence, not an open task.
 
 Unlike [the BhavAI assessment](bhavai.md), **this is not a list of techniques to
 reimplement**. Nothing here is copied or adapted. ripwire is an Apache-2.0 external binary,
