@@ -471,10 +471,18 @@ def agent_turn(messages, user_input):
             name = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"] or "{}")
-            except json.JSONDecodeError as e:
+                if not isinstance(args, dict):
+                    raise ValueError("tool arguments must be an object")
+            except (ValueError, TypeError) as e:
                 result = f"ERROR: malformed tool arguments: {e}"
             else:
                 key = (name, json.dumps(args, sort_keys=True))
+                if name == "read_file" and isinstance(args.get("path"), str):
+                    try:
+                        stat = os.stat(args["path"])
+                        key += (stat.st_mtime_ns, stat.st_size)
+                    except OSError:
+                        pass
                 if key in recent_keys:  # identical back-to-back call — a loop, don't rerun it
                     result = ("[skipped: identical to a recent call. Reuse its earlier observation. Repeating it changes "
                               "nothing — make a different change, verify, or stop and summarize.]")
@@ -1014,6 +1022,23 @@ def selftest():
         transcript = [{"role": "system", "content": "s"}]
         agent_turn(transcript, "write")
     assert sum("skipped: identical" in (m.get("content") or "") for m in transcript) == 1
+
+    # A file changed outside the edit tools may be read again with identical args.
+    tool_write_file(probe, "before")
+    reads = iter([call(json.dumps({"path": probe})), call(json.dumps({"path": probe})), done])
+    def changing_chat(transcript):
+        msg = next(reads)
+        if sum(m["role"] == "tool" for m in transcript) == 1 and msg.get("tool_calls"):
+            tool_write_file(probe, "changed externally")
+        return msg
+    with patch.dict(globals(), chat=changing_chat):
+        transcript = [{"role": "system", "content": "s"}]
+        agent_turn(transcript, "read")
+    assert any(m["role"] == "tool" and "changed externally" in m["content"] for m in transcript)
+    with patch.dict(globals(), chat=lambda m, it=iter([call("[]"), done]): next(it)):
+        transcript = [{"role": "system", "content": "s"}]
+        agent_turn(transcript, "read")
+    assert any("malformed tool arguments" in (m.get("content") or "") for m in transcript)
 
     pyprobe = probe + ".py"
     tool_write_file(pyprobe, "x = 1\n")
