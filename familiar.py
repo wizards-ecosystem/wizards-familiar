@@ -483,7 +483,7 @@ def agent_turn(messages, user_input):
                         key += (stat.st_mtime_ns, stat.st_size)
                     except OSError:
                         pass
-                if key in recent_keys:  # identical back-to-back call — a loop, don't rerun it
+                if key in recent_keys:
                     result = ("[skipped: identical to a recent call. Reuse its earlier observation. Repeating it changes "
                               "nothing — make a different change, verify, or stop and summarize.]")
                 else:
