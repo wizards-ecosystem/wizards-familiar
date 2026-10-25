@@ -10,13 +10,19 @@ Python 3.11+ on Windows, Linux or macOS; no cloud inference or API key.
 
 ## Run
 
-Start a local OpenAI-compatible server with native streaming tool calls, then:
+Get the wheel or source archive from the [latest GitHub release](https://github.com/wizards-ecosystem/wizards-familiar/releases/latest).
+Familiar is not published to PyPI. With Python 3.11+, install the downloaded wheel
+using `python -m pip install <wheel-path>`, or run `python familiar.py /path/to/workspace`
+from the extracted source. To install a source checkout:
 
 ```sh
+git clone https://github.com/wizards-ecosystem/wizards-familiar.git
+cd wizards-familiar
 python -m pip install .
-familiar /path/to/workspace
-# Or: python familiar.py /path/to/workspace
 ```
+
+Start a local OpenAI-compatible server with native streaming tool calls, then run
+`familiar /path/to/workspace`. [Release notes](CHANGELOG.md) describe shipped changes.
 
 No model is downloaded. `serve.sh` / `familiar-serve` optionally launches a separately
 provisioned Ornith-1.0-35B Q4_K_M model on macOS on Apple Silicon. Other platforms

@@ -31,6 +31,9 @@ classifiers = [
 Homepage = "https://github.com/wizards-ecosystem/wizards-familiar"
 Source = "https://github.com/wizards-ecosystem/wizards-familiar"
 Changelog = "https://github.com/wizards-ecosystem/wizards-familiar/blob/main/CHANGELOG.md"
+Releases = "https://github.com/wizards-ecosystem/wizards-familiar/releases"
+Issues = "https://github.com/wizards-ecosystem/wizards-familiar/issues"
+Security = "https://github.com/wizards-ecosystem/wizards-familiar/security/policy"
 
 [project.scripts]
 familiar = "familiar:main"
