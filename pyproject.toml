@@ -12,7 +12,6 @@ authors = [{ name = "Isaac Limb" }]
 keywords = ["coding-agent", "llm", "local-first", "llama-cpp", "cli"]
 dynamic = ["version"]
 
-# Intentionally empty, and checked by CI. The agent is standard library only.
 dependencies = []
 
 classifiers = [
@@ -21,6 +20,8 @@ classifiers = [
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development",
@@ -40,9 +41,8 @@ path = "familiar.py"
 [tool.hatch.build.targets.wheel]
 only-include = ["familiar.py"]
 
-# serve.sh launches the model, so an install that omitted it would only be half the tool.
 [tool.hatch.build.targets.wheel.shared-scripts]
 "serve.sh" = "familiar-serve"
 
 [tool.hatch.build.targets.sdist]
-include = ["familiar.py", "serve.sh", "test_serve.sh", "README.md", "LICENSE", "CHANGELOG.md"]
+include = ["familiar.py", "serve.sh", "test_serve.sh", "README.md", "AGENTS.md", "FAMILIAR.md", "SECURITY.md", "LICENSE", "CHANGELOG.md"]

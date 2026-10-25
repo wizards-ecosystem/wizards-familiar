@@ -1,231 +1,522 @@
 #!/usr/bin/env python3
-# The Wizard's Familiar — minimal local coding agent (stdlib only). See README.
+
 import ast
+import hashlib
+import ipaddress
 import json
 import os
 import re
 import select
+import shlex
 import shutil
+import signal
+import socket
+import stat
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 try:
     import termios
     import tty
     _RAW_OK = True
-except ImportError:  # non-unix; read_input() falls back to plain input()
+except ImportError:
     _RAW_OK = False
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-BASE_URL = os.environ.get("FAMILIAR_URL", "http://localhost:8321/v1")
-MODEL = os.environ.get("FAMILIAR_MODEL", "local")
-CTX_CHARS = 55000 * 3  # ~3 chars/token; resolve_ctx_budget() sizes this to the server window at startup
+BASE_URL = "http://127.0.0.1:8321/v1"
+MODEL = "local"
+WINDOW = 0
+MAX_TOKENS = 0
+COMPACT_TOKENS = 0
+MARGIN = 0
+REPLY_BYTES = 0
 MAX_TOOL_OUTPUT = 8000
+MAX_CALLS = 4
 MAX_STEPS = 40
-BASH_TIMEOUT = int(os.environ.get("FAMILIAR_BASH_TIMEOUT", "300"))  # seconds; raise for slow builds/tests
-HISTFILE = os.path.expanduser(os.environ.get("FAMILIAR_HISTFILE", "~/.familiar_history"))
+MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_SCAN_BYTES = 32 * 1024 * 1024
+BASH_TIMEOUT = 300
+SHELL = None
+TOKEN_FIELD = "max_tokens"
+STREAM_USAGE = True
+HISTORY_ENABLED = True
+HISTFILE = os.path.expanduser("~/.familiar_history")
+LAST_USAGE = None
+TOKEN_SCALE = 1.0
+PLAN = False
+SYSTEM_PROMPT = ""
+DIM, BOLD, RESET = ("\033[2m", "\033[1m", "\033[0m") if _RAW_OK and sys.stdout.isatty() and os.environ.get("TERM") != "dumb" else ("", "", "")
+STATE = {"pending_check": False, "nudged": False, "last_check": None, "recent": [], "draft": None, "pause": ""}
+_READ_SEEN = {}
+_FILE_VERSIONS = {}
+MUTATORS = {"write_file", "edit_file", "multi_edit"}
+READ_ONLY = {"read_file", "search"}
 
-LAST_USAGE = None  # real token counts from the server's last stream, if it reports them
-PLAN = False  # /plan: read-only mode — edit tools disabled, model proposes changes instead
 
-DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+class ContextPause(Exception):
+    pass
 
-SYSTEM_PROMPT = ""  # built by init_workspace(), which needs the working directory first
+
+class ProtocolError(Exception):
+    pass
+
+
+def encoded(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def positive_int(value, name):
+    if isinstance(value, bool) or not re.fullmatch(r"[1-9][0-9]*", str(value)):
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def local_url(url):
+    if any(ord(char) <= 32 for char in url):
+        raise ValueError("FAMILIAR_URL cannot contain whitespace or control characters")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username is not None or parts.password is not None or parts.query or parts.fragment:
+        raise ValueError("FAMILIAR_URL must be an http(s) loopback URL without credentials, query or fragment")
+    try:
+        port = parts.port
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError
+        if parts.hostname.lower() == "localhost":
+            addresses = socket.getaddrinfo("localhost", port or 80, type=socket.SOCK_STREAM)
+            if not addresses or any(not ipaddress.ip_address(a[4][0]).is_loopback for a in addresses):
+                raise ValueError
+        elif not ipaddress.ip_address(parts.hostname).is_loopback:
+            raise ValueError
+    except (ValueError, OSError) as e:
+        raise ValueError("Familiar sends model requests only to loopback; use 127.0.0.1 or [::1] and a valid port") from e
+    return url.rstrip("/")
+
+
+class LocalRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        local_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), LocalRedirect())
+
+
+def resolve_ctx_budget():
+    ceiling = os.environ.get("FAMILIAR_CTX_TOKENS")
+    ceiling = positive_int(ceiling, "FAMILIAR_CTX_TOKENS") if ceiling is not None else None
+    server = None
+    url = BASE_URL.rsplit("/v1", 1)[0] + "/props"
+    try:
+        with HTTP.open(local_url(url), timeout=2) as response:
+            raw = response.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("/props response exceeds 64 KiB")
+        props = json.loads(raw)
+        if not isinstance(props, dict) or not isinstance(props.get("default_generation_settings", {}), dict):
+            raise ValueError("unsupported /props object; configure a compatible local server")
+        value = (props.get("default_generation_settings") or {}).get("n_ctx", props.get("n_ctx"))
+        if value is not None:
+            server = positive_int(value, "server n_ctx")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        pass
+    if server is None and ceiling is None:
+        raise ValueError("No server context limit discovered. Set FAMILIAR_CTX_TOKENS to the server's usable context window.")
+    return min(ceiling or server, server or ceiling), server
+
+
+def configure():
+    global BASE_URL, MODEL, WINDOW, MAX_TOKENS, COMPACT_TOKENS, MARGIN, REPLY_BYTES
+    global MAX_TOOL_OUTPUT, BASH_TIMEOUT, HISTFILE, HISTORY_ENABLED, SHELL, TOKEN_FIELD, STREAM_USAGE
+    BASE_URL = local_url(os.environ.get("FAMILIAR_URL", BASE_URL))
+    MODEL = os.environ.get("FAMILIAR_MODEL", "local").strip()
+    if not MODEL or any(ord(c) < 32 for c in MODEL):
+        raise ValueError("FAMILIAR_MODEL must be a nonempty model name without control characters")
+    BASH_TIMEOUT = positive_int(os.environ.get("FAMILIAR_BASH_TIMEOUT", "300"), "FAMILIAR_BASH_TIMEOUT")
+    TOKEN_FIELD = os.environ.get("FAMILIAR_TOKEN_FIELD", "max_tokens")
+    if TOKEN_FIELD not in {"max_tokens", "max_completion_tokens"}:
+        raise ValueError("FAMILIAR_TOKEN_FIELD must be max_tokens or max_completion_tokens")
+    for name in ("FAMILIAR_HISTORY", "FAMILIAR_STREAM_USAGE"):
+        if os.environ.get(name, "1") not in {"0", "1"}:
+            raise ValueError(f"{name} must be 0 or 1")
+    HISTORY_ENABLED = os.environ.get("FAMILIAR_HISTORY", "1") == "1"
+    STREAM_USAGE = os.environ.get("FAMILIAR_STREAM_USAGE", "1") == "1"
+    HISTFILE = os.path.expanduser(os.environ.get("FAMILIAR_HISTFILE", "~/.familiar_history"))
+    SHELL = os.environ.get("FAMILIAR_SHELL") or None
+    if SHELL and not os.path.isfile(SHELL):
+        raise ValueError("FAMILIAR_SHELL must name an existing shell executable")
+    WINDOW, server = resolve_ctx_budget()
+    MAX_TOKENS = positive_int(os.environ.get("FAMILIAR_MAX_TOKENS", str(min(2048, WINDOW // 8))), "FAMILIAR_MAX_TOKENS")
+    if MAX_TOKENS < 256 or WINDOW < 8192 or MAX_TOKENS > WINDOW // 4:
+        raise ValueError("Use a context of at least 8192 tokens and FAMILIAR_MAX_TOKENS between 256 and one quarter of it")
+    COMPACT_TOKENS = min(1024, WINDOW // 16)
+    MARGIN = max(256, WINDOW // 32)
+    REPLY_BYTES = MAX_TOKENS
+    MAX_TOOL_OUTPUT = min(8000, WINDOW // 8)
+    return server
 
 
 def build_system_prompt():
-    """Assemble the prompt for the current working directory, appending the repo's
-    FAMILIAR.md notes when it has them."""
     notes = ""
-    if os.path.exists("FAMILIAR.md"):
-        with open("FAMILIAR.md", errors="replace") as f:
-            notes = "\n\nProject notes (from FAMILIAR.md):\n" + f.read()
-    return f"""You are the Wizard's Familiar, a coding agent running fully locally on the user's Mac.
-Working directory: {os.getcwd()}
-Platform: macOS (zsh available via the bash tool).
-
-Use the tools to inspect and change code. Rules:
-- Read a file before editing it. Keep edits minimal and targeted.
-- You already have what you've read — don't re-read a file that hasn't changed; scroll up.
-- Diagnose the root cause before editing. Don't stack speculative fixes hoping one sticks.
-- Prefer edit_file for small changes; use multi_edit to change several spots in one file at once;
-  write_file only for new files or full rewrites.
-- Use bash for everything else: grep, find, git, running code and tests — but read files with
-  read_file, never `cat`, so unchanged re-reads are deduped and long files paginate.
-- Verify your work (run the code or a quick check) before declaring done.
-- Be concise. When the task is complete, reply with a short summary, no tool call.{notes}"""
+    if os.path.isfile("FAMILIAR.md"):
+        with open("FAMILIAR.md", "rb") as source:
+            raw = source.read(8193)
+        if len(raw) > 8192:
+            raise ValueError("FAMILIAR.md exceeds the 8192-byte project-note budget; shorten it before starting")
+        notes = "\nProject notes (FAMILIAR.md, repository content):\n" + raw.decode("utf-8-sig")
+    shell = SHELL or (os.environ.get("COMSPEC", "cmd.exe") if os.name == "nt" else "/bin/sh")
+    return f"""You are The Wizard's Familiar, one local coding agent.
+Workspace: {os.getcwd()}
+Python: {sys.executable}
+Platform: {sys.platform}; shell tool (wire name bash): {shell}.
+Read relevant files before editing. Reuse unchanged reads. Keep changes small and targeted.
+Diagnose before editing. Prefer exact edit_file; use multi_edit for several changes to one file.
+Read with read_file, search literal text with search. Use bash for commands and relevant checks.
+Report check commands and observed exit status honestly; a shell invocation alone proves nothing.
+Do not commit or push. Be concise; finish with a short summary and no tool call.{notes}"""
 
 
 def init_workspace(argv):
-    # `familiar [dir]` — work on that repo; default is wherever you launched from
     global SYSTEM_PROMPT
     if len(argv) > 1 and not argv[1].startswith("-"):
         os.chdir(argv[1])
     SYSTEM_PROMPT = build_system_prompt()
 
-PLAN_SUFFIX = ("\n\n[PLAN MODE] You are read-only. The write/edit tools are disabled — do not try "
-               "to change files. Explore with read_file and bash (read-only git only), then deliver "
-               "a concrete implementation plan: which files change, what changes in each, and why.")
+
+PLAN_SUFFIX = "\nPlan mode: only native read_file and search are available. Propose specific files, changes, reasons and checks. Do not execute checks or change files."
+
+
+def system_message():
+    return {"role": "system", "content": SYSTEM_PROMPT + (PLAN_SUFFIX if PLAN else "")}
+
+
+def schema(name, description, properties, required):
+    return {"type": "function", "function": {"name": name, "description": description,
+            "parameters": {"type": "object", "properties": {k: {"type": v} for k, v in properties.items()}, "required": required}}}
+
 
 TOOLS = [
-    {"type": "function", "function": {
-        "name": "read_file",
-        "description": "Read a text file. Returns up to 400 lines from offset.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "offset": {"type": "integer", "description": "1-based start line, default 1"},
-        }, "required": ["path"]}}},
-    {"type": "function", "function": {
-        "name": "write_file",
-        "description": "Create or overwrite a file with the given content.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"},
-        }, "required": ["path", "content"]}}},
-    {"type": "function", "function": {
-        "name": "edit_file",
-        "description": "Replace text in a file. Default: give 'old' (an exact, unique substring) "
-                       "and 'new'. If an exact match is hard (whitespace/ambiguity), instead give "
-                       "'start_line' and 'end_line' (1-based, inclusive) to replace that line range "
-                       "with 'new' (empty 'new' deletes the lines).",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "old": {"type": "string", "description": "exact unique substring to replace (omit if using line range)"},
-            "new": {"type": "string"},
-            "start_line": {"type": "integer", "description": "1-based first line to replace (line-range mode)"},
-            "end_line": {"type": "integer", "description": "1-based last line to replace, inclusive"},
-        }, "required": ["path", "new"]}}},
-    {"type": "function", "function": {
-        "name": "multi_edit",
-        "description": "Apply several exact-match edits to one file in a single call, in order. "
-                       "Atomic: if any 'old' is missing or non-unique at its turn, nothing is written. "
-                       "Use for multi-spot changes to avoid repeated round-trips.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "edits": {"type": "array", "items": {"type": "object", "properties": {
-                "old": {"type": "string"}, "new": {"type": "string"},
-            }, "required": ["old", "new"]}},
-        }, "required": ["path", "edits"]}}},
-    {"type": "function", "function": {
-        "name": "bash",
-        "description": f"Run a shell command in the working directory. {BASH_TIMEOUT}s timeout.",
-        "parameters": {"type": "object", "properties": {
-            "command": {"type": "string"},
-        }, "required": ["command"]}}},
+    schema("read_file", "Read UTF-8 text or list a directory. offset is a 1-based line; limit defaults to 120 (max 400); column is a 1-based byte position for a long line.", {"path": "string", "offset": "integer", "limit": "integer", "column": "integer"}, ["path"]),
+    schema("search", "Find literal text in a file or directory. Bounded UTF-8 scan; limit defaults to 30 (max 100).", {"path": "string", "query": "string", "limit": "integer"}, ["path", "query"]),
+    schema("write_file", "Write a UTF-8 file atomically. Read existing files first.", {"path": "string", "content": "string"}, ["path", "content"]),
+    schema("edit_file", "Replace unique exact old with new, or inclusive start_line/end_line with new. Do not combine forms.", {"path": "string", "old": "string", "new": "string", "start_line": "integer", "end_line": "integer"}, ["path", "new"]),
+    schema("multi_edit", "Sequential unique exact edits to one file; all validate before writing. edits is a nonempty array of old/new objects.", {"path": "string", "edits": "array"}, ["path", "edits"]),
+    schema("bash", "Execute a command in the platform shell; output and runtime are bounded. Unsandboxed; unavailable in Plan.", {"command": "string"}, ["command"]),
 ]
+TOOLS[4]["function"]["parameters"]["properties"]["edits"]["items"] = {"type": "object", "properties": {"old": {"type": "string"}, "new": {"type": "string"}}, "required": ["old", "new"]}
 
 
-# re-read guard — stub an unchanged re-read so a weak model can't spin on it;
-# cleared on trim and /new so an evicted read can be fetched again.
-_READ_SEEN = {}  # realpath -> {"sig": (mtime_ns, size), "offsets": set()}
+def active_tools():
+    return [t for t in TOOLS if not PLAN or t["function"]["name"] in READ_ONLY]
 
 
-def tool_read_file(path, offset=1, **_):
-    if os.path.isdir(path):  # a weak model often reads a dir by mistake — list it, don't error
-        entries = sorted(os.listdir(path))
-        listing = "\n".join(e + ("/" if os.path.isdir(os.path.join(path, e)) else "") for e in entries)
-        return f"[{path} is a directory, {len(entries)} entries]\n{listing}" if entries else f"[{path} is an empty directory]"
-    off = int(offset)
-    rp = os.path.realpath(path)
-    try:
-        st = os.stat(path)
-        sig = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        sig = None
+def validate_args(name, args):
+    tool = next((t["function"] for t in TOOLS if t["function"]["name"] == name), None)
+    if not tool or not isinstance(args, dict):
+        raise ValueError("unknown tool or arguments are not an object")
+    params = tool["parameters"]
+    if any(k not in args for k in params["required"]) or any(k not in params["properties"] for k in args):
+        raise ValueError(f"{name}: missing required or unknown arguments")
+    types = {"string": str, "integer": int, "array": list}
+    for key, value in args.items():
+        if type(value) is not types[params["properties"][key]["type"]]:
+            raise ValueError(f"{name}: invalid type for {key}")
+    if name == "multi_edit" and (not args["edits"] or any(not isinstance(e, dict) or set(e) != {"old", "new"} or not isinstance(e["old"], str) or not e["old"] or not isinstance(e["new"], str) for e in args["edits"])):
+        raise ValueError("edits must be nonempty old/new string objects with nonempty old")
+
+
+def digest_file(path):
+    value = hashlib.sha256()
+    scanned = 0
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(65536), b""):
+            scanned += len(chunk)
+            if scanned > MAX_FILE_BYTES:
+                raise ValueError("file grew beyond the bounded fingerprint size; read it again")
+            value.update(chunk)
+    return value.digest()
+
+
+def file_signature(path):
+    info = os.stat(path)
+    return digest_file(path) if stat.S_ISREG(info.st_mode) and info.st_size <= MAX_FILE_BYTES else (info.st_mtime_ns, info.st_size)
+
+
+def text_prefix(value, budget):
+    return value.encode("utf-8")[:max(0, budget)].decode("utf-8", errors="ignore")
+
+
+def tool_read_file(path, offset=1, limit=120, column=1, _budget=None):
+    budget = _budget or MAX_TOOL_OUTPUT
+    if type(offset) is not int or type(limit) is not int or type(column) is not int or offset < 1 or column < 1 or not 1 <= limit <= 400:
+        return "ERROR: offset/column must be positive and limit must be 1..400"
+    if os.path.isdir(path):
+        body, count = [], 0
+        with os.scandir(path) as entries:
+            for entry in entries:
+                item = entry.name + ("/" if entry.is_dir(follow_symlinks=False) else "")
+                if count >= 400 or len(encoded(body + [item])) > budget - 256:
+                    return f"[{path} is a directory; listing truncated after {count} entries; use a narrower path]\n" + "\n".join(body)
+                body.append(item)
+                count += 1
+        return f"[{path} is a directory, {count} entries]\n" + "\n".join(sorted(body))
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        return "ERROR: read_file accepts regular files and directories only"
+    rp, page = os.path.realpath(path), (offset, limit, column, budget)
+    sig = file_signature(path)
     seen = _READ_SEEN.get(rp)
-    if seen and seen["sig"] == sig and off in seen["offsets"]:
-        return (f"[already read {path} (from line {off}) earlier in this conversation and it "
-                "hasn't changed since — reuse that read instead of reading it again]")
-    with open(path, errors="replace") as f:
-        lines = f.readlines()
-    start = max(off - 1, 0)
-    chunk = lines[start:start + 400]
-    body = "".join(f"{start + i + 1}\t{l}" for i, l in enumerate(chunk))
-    if start + 400 < len(lines):
-        body += f"\n[truncated: file has {len(lines)} lines, use offset to read more]"
-    if seen and seen["sig"] == sig:
-        seen["offsets"].add(off)
-    else:
-        _READ_SEEN[rp] = {"sig": sig, "offsets": {off}}
-    return body or "[empty file]"
+    if seen and seen["sig"] == sig and page in seen["pages"]:
+        return f"[already read {path} from line {offset}, byte {column}; unchanged — reuse the earlier source]"
+    body, used, line_no, scanned = [], 0, 1, 0
+    continuation = ""
+    with open(path, "rb") as source:
+        while line_no < offset:
+            chunk = source.readline(65536)
+            if not chunk:
+                return f"ERROR: offset {offset} exceeds the file's {line_no - 1} lines"
+            scanned += len(chunk)
+            if scanned > MAX_SCAN_BYTES:
+                return f"ERROR: line seek exceeded {MAX_SCAN_BYTES} bytes; search a narrower file or earlier region"
+            if chunk.endswith(b"\n"):
+                line_no += 1
+        if column > MAX_SCAN_BYTES:
+            return "ERROR: column exceeds the bounded line seek"
+        if column > 1:
+            skipped = source.read(column - 1)
+            if len(skipped) != column - 1 or b"\n" in skipped:
+                return "ERROR: column is past the requested line"
+        for _ in range(limit):
+            room = budget - 320 - used
+            if room < 16:
+                continuation = f"offset={line_no}, column=1"
+                break
+            raw = source.readline(max(1, room // 6))
+            if not raw:
+                break
+            if b"\0" in raw:
+                return "ERROR: binary input is not supported"
+            complete = raw.endswith(b"\n") or source.peek(1) == b""
+            if not complete:
+                if raw.endswith(b"\r"):
+                    raw = raw[:-1]
+                while raw and raw[-1] >= 128:
+                    try:
+                        raw.decode("utf-8-sig" if line_no == 1 and column == 1 else "utf-8")
+                        break
+                    except UnicodeDecodeError as error:
+                        if error.reason != "unexpected end of data":
+                            raise
+                        raw = raw[:error.start]
+                continuation = f"offset={line_no}, column={column + len(raw)}"
+            text = raw.decode("utf-8-sig" if line_no == 1 and column == 1 else "utf-8").replace("\r\n", "\n")
+            item = f"{line_no}\t{text}"
+            body.append(item)
+            used += len(encoded(item))
+            if not complete:
+                break
+            line_no += 1
+            column = 1
+        else:
+            if source.peek(1):
+                continuation = f"offset={line_no}, column=1"
+    if file_signature(path) != sig:
+        return "ERROR: file changed during read; retry"
+    if isinstance(sig, bytes):
+        _FILE_VERSIONS[rp] = sig
+    if not seen or seen["sig"] != sig:
+        seen = {"sig": sig, "pages": set()}
+        _READ_SEEN[rp] = seen
+    seen["pages"].add(page)
+    receipt = f"[{path}: lines from {offset}, byte {page[2]}]\n" + "".join(body)
+    if continuation:
+        receipt += f"\n[truncated; unread source starts at {continuation}; call read_file with those values]"
+    return receipt if body else f"[{path}: empty file or end of file]"
+
+
+def tool_search(path, query, limit=30, _budget=None):
+    budget = _budget or MAX_TOOL_OUTPUT
+    if not query or "\n" in query or len(query.encode("utf-8")) > 1024 or type(limit) is not int or not 1 <= limit <= 100:
+        return "ERROR: use a nonempty literal query of at most 1024 bytes, no newline, and limit 1..100"
+    pending, matches, skipped = [path], [], []
+    scanned = files = entries = 0
+    limited = False
+    while pending and not limited:
+        current = pending.pop()
+        try:
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode):
+                if len(skipped) < 8:
+                    skipped.append(f"{current} (symlink)")
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                with os.scandir(current) as children:
+                    for entry in children:
+                        entries += 1
+                        if entries > 2000:
+                            limited = True
+                            break
+                        if entry.name not in {".git", ".claude", "__pycache__", "node_modules", ".venv"}:
+                            pending.append(entry.path)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                if len(skipped) < 8:
+                    skipped.append(f"{current} (non-regular)")
+                continue
+            files += 1
+            if files > 200 or scanned + info.st_size > MAX_SCAN_BYTES or info.st_size > MAX_FILE_BYTES:
+                limited = True
+                break
+            with open(current, "rb") as source:
+                raw = source.read(min(MAX_FILE_BYTES + 1, MAX_SCAN_BYTES - scanned + 1))
+            scanned += len(raw)
+            if len(raw) > MAX_FILE_BYTES or scanned > MAX_SCAN_BYTES:
+                limited = True
+                break
+            if b"\0" in raw:
+                raise UnicodeError("binary")
+            text = raw.decode("utf-8-sig")
+            for number, line in enumerate(text.splitlines(), 1):
+                if query in line:
+                    index = line.index(query)
+                    excerpt = text_prefix(line[max(0, index - 60):], 240)
+                    item = f"{current}:{number}: {excerpt}" + (" [match text truncated]" if len(line.encode("utf-8")) > 240 else "")
+                    if len(matches) >= limit or len(encoded(matches + [item])) > budget - 512:
+                        limited = True
+                        break
+                    matches.append(item)
+        except (OSError, UnicodeError) as error:
+            if len(skipped) < 8:
+                skipped.append(text_prefix(f"{current} ({type(error).__name__})", 120))
+    suffix = f"\n[scan: {files} files, {scanned} bytes; excludes .git/.claude/cache/dependency directories; symlinks not followed]"
+    if skipped:
+        suffix += "\n[skipped paths, first 8: " + "; ".join(skipped) + "]"
+    if limited:
+        suffix += "\n[scan/match/output limit reached; more paths or matches may remain; narrow path/query]"
+    return ("\n".join(matches) or "[no matches in scanned text]") + suffix
 
 
 def python_edit_error(path, content):
     if str(path).endswith(".py"):
         try:
             ast.parse(content, filename=str(path))
-        except (SyntaxError, ValueError) as e:
-            return f"ERROR: invalid Python (nothing written): {e}"
+        except (SyntaxError, ValueError) as error:
+            return f"ERROR: invalid Python (nothing written): {error}"
     return None
 
 
-def tool_write_file(path, content, **_):
+def edit_target(path):
+    if not os.path.lexists(path):
+        return None, "", False, "\n", None
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("mutation requires a regular non-symlink file")
+    if not info.st_mode & 0o222 or not os.access(path, os.W_OK):
+        raise PermissionError("target is read-only")
+    if info.st_size > MAX_FILE_BYTES:
+        raise ValueError("file exceeds the 8 MiB edit limit")
+    with open(path, "rb") as source:
+        raw = source.read(MAX_FILE_BYTES + 1)
+    if len(raw) > MAX_FILE_BYTES:
+        raise ValueError("file exceeds the 8 MiB edit limit")
+    version = hashlib.sha256(raw).digest()
+    expected = _FILE_VERSIONS.get(os.path.realpath(path))
+    if expected is not None and expected != version:
+        raise ValueError("file changed since the last read; read it again before editing")
+    text = raw.decode("utf-8-sig")
+    remainder = text.replace("\r\n", "")
+    if "\r" in remainder or ("\r\n" in text and "\n" in remainder):
+        raise ValueError("mixed or unsupported line endings; nothing written")
+    return raw, text.replace("\r\n", "\n"), raw.startswith(b"\xef\xbb\xbf"), "\r\n" if "\r\n" in text else "\n", info
+
+
+def atomic_write(path, content, target):
+    before, _, bom, newline, info = target
     error = python_edit_error(path, content)
     if error:
         return error
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with open(path, "w") as f:
-        f.write(content)
-    return f"wrote {len(content)} chars to {path}"
+    if "\r" in content.replace("\r\n", ""):
+        raise ValueError("unsupported carriage return in replacement")
+    data = (b"\xef\xbb\xbf" if bom else b"") + content.replace("\r\n", "\n").replace("\n", newline).encode("utf-8")
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError("result exceeds the 8 MiB edit limit")
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".familiar-", dir=parent)
+    committed, cleanup_error = False, None
+    try:
+        with os.fdopen(fd, "wb") as destination:
+            destination.write(data)
+            destination.flush()
+            os.fsync(destination.fileno())
+        if info is not None:
+            os.chmod(temporary, stat.S_IMODE(info.st_mode))
+            current = os.lstat(path)
+            if not stat.S_ISREG(current.st_mode) or current.st_mode != info.st_mode or not current.st_mode & 0o222 or digest_file(path) != hashlib.sha256(before).digest():
+                raise ValueError("file changed before replacement; read it again")
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+        committed = True
+        _FILE_VERSIONS[os.path.realpath(path)] = hashlib.sha256(data).digest()
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        except OSError as error:
+            if not committed:
+                raise
+            cleanup_error = error
+    return f"wrote {len(data)} bytes to {path}" + (f"; temporary cleanup failed: {temporary}: {cleanup_error}" if cleanup_error else "")
 
 
-def tool_edit_file(path, old=None, new="", start_line=None, end_line=None, **_):
-    with open(path, errors="replace") as f:
-        text = f.read()
-    if start_line is not None:  # line-range replace — a fallback when exact match is awkward
+def tool_write_file(path, content, _budget=None):
+    return atomic_write(path, content, edit_target(path))
+
+
+def tool_edit_file(path, old=None, new="", start_line=None, end_line=None, _budget=None):
+    target = edit_target(path)
+    if target[0] is None:
+        return "ERROR: file does not exist"
+    text = target[1]
+    if old is not None:
+        if start_line is not None or end_line is not None or not old:
+            return "ERROR: use nonempty old or a line range, never both"
+        old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+        count = text.count(old)
+        if count != 1:
+            return f"ERROR: old string appears {count} times; require one exact unique match (nothing written)"
+        content = text.replace(old, new, 1)
+    else:
         lines = text.splitlines(keepends=True)
-        s = int(start_line) - 1
-        e = int(end_line) if end_line is not None else int(start_line)
-        if s < 0 or s >= len(lines):
-            return f"ERROR: start_line {start_line} out of range (file has {len(lines)} lines)"
-        repl = [] if new == "" else [new if new.endswith("\n") else new + "\n"]
-        lines[s:e] = repl
-        content = "".join(lines)
-        error = python_edit_error(path, content)
-        if error:
-            return error
-        with open(path, "w") as f:
-            f.write(content)
-        return f"replaced lines {start_line}-{e} in {path}"
-    if not old:
-        return "ERROR: provide 'old' (exact match) or 'start_line'/'end_line'"
-    n = text.count(old)
-    if n == 0:
-        return "ERROR: old string not found in file"
-    if n > 1:
-        return f"ERROR: old string appears {n} times, add context to make it unique"
-    content = text.replace(old, new, 1)
-    error = python_edit_error(path, content)
-    if error:
-        return error
-    with open(path, "w") as f:
-        f.write(content)
-    return f"edited {path}"
+        if type(start_line) is not int or type(end_line) is not int or not 1 <= start_line <= end_line <= len(lines):
+            return f"ERROR: require 1 <= start_line <= end_line <= {len(lines)} (nothing written)"
+        replacement = new.replace("\r\n", "\n")
+        if replacement and (end_line < len(lines) or lines[end_line - 1].endswith("\n")) and not replacement.endswith("\n"):
+            replacement += "\n"
+        content = "".join(lines[:start_line - 1]) + replacement + "".join(lines[end_line:])
+    return atomic_write(path, content, target)
 
 
-def tool_multi_edit(path, edits, **_):
-    # atomic: validate+apply sequentially in memory, write only if all succeed
-    with open(path, errors="replace") as f:
-        text = f.read()
-    for i, e in enumerate(edits, 1):
-        old = e["old"]
-        n = text.count(old)
-        if n == 0:
-            return f"ERROR: edit {i}: old string not found (nothing written)"
-        if n > 1:
-            return f"ERROR: edit {i}: old string appears {n} times, add context (nothing written)"
-        text = text.replace(old, e["new"], 1)
-    error = python_edit_error(path, text)
-    if error:
-        return error
-    with open(path, "w") as f:
-        f.write(text)
-    return f"applied {len(edits)} edits to {path}"
+def tool_multi_edit(path, edits, _budget=None):
+    validate_args("multi_edit", {"path": path, "edits": edits})
+    target = edit_target(path)
+    if target[0] is None:
+        return "ERROR: file does not exist"
+    text = target[1]
+    for i, edit in enumerate(edits, 1):
+        old = edit["old"].replace("\r\n", "\n")
+        count = text.count(old)
+        if count != 1:
+            return f"ERROR: edit {i}: old string appears {count} times (nothing written)"
+        text = text.replace(old, edit["new"].replace("\r\n", "\n"), 1)
+    return atomic_write(path, text, target)
 
 
 GIT_RO = {"status", "log", "diff", "show", "blame", "grep", "ls-files", "ls-remote",
@@ -234,279 +525,601 @@ GIT_RO = {"status", "log", "diff", "show", "blame", "grep", "ls-files", "ls-remo
 
 
 def git_guard(command):
-    # read-only git allowlist; non-git writes stay open (trusted single user)
-    for m in re.finditer(r"\bgit\b((?:\s+(?:-C\s+\S+|--?[\w=./-]+))*)\s+([\w-]+)", command):
-        sub = m.group(2)
-        args = re.split(r"[;&|]", command[m.end():])[0]  # this invocation's args only
-        mutating_branch = sub == "branch" and re.search(
-            r"(^|\s)-[dDmMcCf]\b|--(delete|move|copy|force|set-upstream|unset-upstream|edit-description)", args)
+    for match in re.finditer(r"\bgit\b((?:\s+(?:-C\s+\S+|--?[\w=./-]+))*)\s+([\w-]+)", command):
+        sub = match.group(2)
+        args = re.split(r"[;&|]", command[match.end():])[0]
+        mutating_branch = sub == "branch" and re.search(r"(^|\s)-[dDmMcCf]\b|--(delete|move|copy|force|set-upstream|unset-upstream|edit-description)", args)
         if sub not in GIT_RO or mutating_branch:
-            return (f"ERROR: 'git {sub}' is blocked — Familiar may only run read-only "
-                    "git commands (status, log, diff, show, branch, blame, ...)")
+            return f"ERROR: 'git {sub}' is blocked; Familiar only runs read-only git commands"
     return None
 
 
-# route a bare `cat file` through read_file so the re-read guard dedupes it — a weak
-# model reaches for cat and re-dumps the same file into context. Pipes/redirects/flags/globs/vars
-# fall through to real bash; cat is legitimate inside a pipeline.
-_BARE_CAT = re.compile(r"^\s*cat\s+(?P<args>[^|&;<>`$()]+?)\s*$")
-
-
 def bare_cat_paths(command):
-    m = _BARE_CAT.match(command)
-    if not m:
+    if not re.fullmatch(r"\s*cat\s+[^|&;<>`$()*?\[\]]+\s*", command):
         return None
-    parts = m.group("args").split()
-    if not parts or any(p.startswith("-") for p in parts):
+    try:
+        parts = shlex.split(command, posix=os.name != "nt")[1:]
+    except ValueError:
         return None
-    return parts
+    parts = [part.strip('"') if os.name == "nt" else part for part in parts]
+    return parts if parts and not any(p.startswith("-") for p in parts) else None
 
 
-def tool_bash(command, **_):
-    # git is read-only (guard above); everything else unsandboxed by design
+class OutputBuffer:
+    def __init__(self, limit):
+        self.limit, self.total = limit, 0
+        self.head, self.tail = b"", b""
+
+    def add(self, data):
+        self.total += len(data)
+        half = self.limit // 2
+        missing = max(0, half - len(self.head))
+        self.head += data[:missing]
+        self.tail = (self.tail + data[missing:])[-(self.limit - half):]
+
+    def render(self, prefix, budget):
+        head, tail = self.head, self.tail
+        while True:
+            omitted = self.total - len(head) - len(tail)
+            marker = f"\n[output truncated: {omitted} bytes omitted]\n".encode() if omitted else b""
+            result = prefix + (head + marker + tail).decode("utf-8", errors="replace")
+            if len(encoded(result)) <= budget:
+                return result
+            if not head and not tail:
+                return text_prefix(prefix, budget // 4) + "\n[output omitted]"
+            head, tail = head[:len(head) * 3 // 4], tail[len(tail) - len(tail) * 3 // 4:]
+
+
+def stop_process(process):
+    if os.name == "nt":
+        try:
+            os.kill(process.pid, signal.CTRL_BREAK_EVENT)
+        except (OSError, ValueError):
+            pass
+        taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+        try:
+            result = subprocess.run([taskkill, "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            note = "native tree termination requested; detached descendants unverified" if result.returncode == 0 else "descendant cleanup uncertain (native tree termination failed)"
+        except (OSError, subprocess.TimeoutExpired):
+            note = "descendant cleanup uncertain (native tree termination unavailable)"
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                note = "process cleanup uncertain: native termination and parent kill failed"
+    else:
+        note = "process group terminated; detached descendants unverified"
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                break
+            except OSError:
+                note = "process-group cleanup uncertain: signaling failed"
+                break
+            if sig == signal.SIGTERM:
+                time.sleep(0.1)
+    try:
+        process.wait(timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        note = "process cleanup uncertain: parent still running"
+    return note
+
+
+def tool_bash(command, _budget=None):
+    budget = _budget or MAX_TOOL_OUTPUT
     paths = bare_cat_paths(command)
-    if paths and all(os.path.isfile(p) for p in paths):
-        return "\n".join(tool_read_file(p) for p in paths)
+    if paths and all(os.path.isfile(path) for path in paths):
+        if len(paths) > 4 or budget // len(paths) < 512:
+            return "ERROR: read fewer files per call to retain bounded source pages"
+        return "\n".join(tool_read_file(path, _budget=budget // len(paths) - 16) for path in paths)
     blocked = git_guard(command)
     if blocked:
         return blocked
+    if os.name == "nt":
+        argv = subprocess.list2cmdline([SHELL or os.environ.get("COMSPEC", "cmd.exe")]) + ' /d /s /c "' + command + '"'
+        options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        argv = [SHELL or "/bin/sh", "-c", command]
+        options = {"start_new_session": True}
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, **options)
+    output, done, stop_reader = OutputBuffer(max(32, budget - 512)), threading.Event(), threading.Event()
+
+    def drain():
+        try:
+            if os.name == "nt":
+                import ctypes
+                import msvcrt
+                from ctypes import wintypes
+                peek = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
+                peek.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+                peek.restype = wintypes.BOOL
+                handle = msvcrt.get_osfhandle(process.stdout.fileno())
+            while not stop_reader.is_set():
+                size = 4096
+                if os.name == "nt":
+                    available = wintypes.DWORD()
+                    if not peek(handle, None, 0, None, ctypes.byref(available), None):
+                        break
+                    if not available.value:
+                        stop_reader.wait(0.02)
+                        continue
+                    size = min(size, available.value)
+                data = process.stdout.read(size)
+                if not data:
+                    break
+                output.add(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            done.set()
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    status, cleanup = "", ""
     try:
-        r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=BASH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return f"ERROR: command timed out after {BASH_TIMEOUT}s (raise FAMILIAR_BASH_TIMEOUT)"
-    out = (r.stdout + r.stderr).strip()
-    return f"exit {r.returncode}\n{out}" if out else f"exit {r.returncode} (no output)"
+        try:
+            process.wait(timeout=BASH_TIMEOUT)
+            status = f"exit {process.returncode}"
+        except subprocess.TimeoutExpired:
+            status = f"ERROR: command timed out after {BASH_TIMEOUT}s"
+            cleanup = stop_process(process)
+        except KeyboardInterrupt:
+            cleanup = stop_process(process)
+            status = "CANCELED: command interrupted; side effects may have occurred"
+        if not done.wait(0.3):
+            cleanup = stop_process(process)
+            if not done.wait(0.5):
+                cleanup += "; output pipe cleanup uncertain"
+    finally:
+        if process.poll() is None:
+            cleanup = stop_process(process)
+        stop_reader.set()
+        reader.join(timeout=0.5)
+        process.stdout.close()
+    return output.render(status + (f"\n[{cleanup}]" if cleanup else "") + "\n", budget)
 
 
-TOOL_IMPL = {"read_file": tool_read_file, "write_file": tool_write_file,
+TOOL_IMPL = {"read_file": tool_read_file, "search": tool_search, "write_file": tool_write_file,
              "edit_file": tool_edit_file, "multi_edit": tool_multi_edit, "bash": tool_bash}
 
 
-def run_tool(name, args):
-    if PLAN and name in MUTATORS:
-        return ("ERROR: plan mode is read-only — the edit tools are off. Propose the change in "
-                "your plan instead of making it (/plan to exit plan mode).")
+def run_tool(name, args, budget=None):
+    if PLAN and name not in READ_ONLY:
+        return "ERROR: Plan is read-only; shell and mutation tools are disabled. Switch to Normal with /plan."
     try:
-        result = TOOL_IMPL[name](**args)
-    except Exception as e:  # bad path, bad args — feed the error back to the model
-        result = f"ERROR: {type(e).__name__}: {e}"
-    if len(result) > MAX_TOOL_OUTPUT:
-        keep = (MAX_TOOL_OUTPUT - 80) // 2
-        omitted = len(result) - keep * 2
-        result = result[:keep] + f"\n[output truncated: {omitted} characters omitted]\n" + result[-keep:]
+        validate_args(name, args)
+        result = TOOL_IMPL[name](**args, _budget=budget or MAX_TOOL_OUTPUT)
+    except Exception as error:
+        result = f"ERROR: {type(error).__name__}: {error}"
+    limit = budget or MAX_TOOL_OUTPUT
+    if len(encoded(result)) > limit:
+        result = text_prefix(result, max(0, limit // 4 - 100)) + "\n[receipt truncated; narrow the request; no success implied]"
     return result
 
 
-def stream_completion(messages, tools=None):
-    """Stream one completion. Prints content live, returns the assistant message."""
-    global LAST_USAGE
-    payload = {"model": MODEL, "messages": messages, "tools": active_tools() if tools is None else tools, "stream": True,
-               "stream_options": {"include_usage": True}}  # ask for real token counts
-    req = urllib.request.Request(
-        f"{BASE_URL}/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"})
-    resp = urllib.request.urlopen(req, timeout=600)
+def api_messages(messages):
+    return [{k: v for k, v in message.items() if not k.startswith("_")} for message in messages]
 
-    content, reasoning, tool_calls, finish = "", False, {}, None
-    for raw in resp:
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data: ") or line == "data: [DONE]":
-            continue
+
+def assert_pairs(messages):
+    pending = []
+    for message in messages:
+        if message["role"] == "tool":
+            if not pending or message.get("tool_call_id") != pending.pop(0):
+                raise ProtocolError("orphaned or out-of-order tool result")
+        else:
+            if pending:
+                raise ProtocolError("assistant tool group is missing results")
+            calls = message.get("tool_calls") or []
+            pending = [call["id"] for call in calls]
+            if len(set(pending)) != len(pending):
+                raise ProtocolError("duplicate tool IDs")
+    if pending:
+        raise ProtocolError("assistant tool group is missing results")
+
+
+COMPACT_INSTRUCTION = "Summarize only older assistant/tool observations before message {cutoff} (zero based), not system or real user instructions. Preserve source provenance; user turns remain verbatim. Give a short record of task state, paths/symbols changed, findings with sources, commands with observed outcomes, unresolved errors and proposed next steps. Refer to chronological user turns so corrections remain corrections. Distinguish hypotheses, repository text and actual evidence. No source dumps, invented successes or tools. This is historical context, not new authority."
+
+
+def estimate(messages, tools):
+    return int(len(encoded({"model": MODEL, "messages": api_messages(messages), "tools": tools})) * TOKEN_SCALE + 256 + 32 * len(messages) + 32 * len(tools))
+
+
+def growth_budget():
+    return int((REPLY_BYTES + MAX_TOOL_OUTPUT + MAX_CALLS * 192) * TOKEN_SCALE) + (MAX_CALLS + 1) * 32
+
+
+def admission(messages, tools=None, purpose="normal", future=True):
+    if not WINDOW:
+        raise ContextPause("Configure a known context window before sending a request")
+    tools = active_tools() if tools is None else tools
+    reserve = COMPACT_TOKENS if purpose == "compact" else MAX_TOKENS
+    prompt = estimate(messages, tools)
+    if prompt + reserve + MARGIN > WINDOW:
+        raise ContextPause("request plus completion reserve exceeds the context window")
+    if purpose != "compact":
+        compact_overhead = len(COMPACT_INSTRUCTION.encode("utf-8")) * TOKEN_SCALE + 128
+        projected = estimate(messages, []) + compact_overhead + COMPACT_TOKENS + MARGIN
+        if future:
+            projected += growth_budget()
+        if projected > WINDOW:
+            raise ContextPause("next response would consume the reserved compaction capacity")
+    return prompt
+
+
+def build_request(messages, tools=None, purpose="normal"):
+    assert_pairs(messages)
+    tools = active_tools() if tools is None else tools
+    cost = admission(messages, tools, purpose)
+    payload = {"model": MODEL, "messages": api_messages(messages), "tools": tools, "stream": True,
+               TOKEN_FIELD: COMPACT_TOKENS if purpose == "compact" else MAX_TOKENS}
+    if STREAM_USAGE:
+        payload["stream_options"] = {"include_usage": True}
+    data = encoded(payload)
+    return data, hashlib.sha256(data).hexdigest(), cost
+
+
+def validate_calls(calls):
+    ids = set()
+    for call in calls:
+        if not isinstance(call.get("id"), str) or not call["id"] or len(call["id"].encode("utf-8")) > 128 or call["id"] in ids:
+            raise ProtocolError("tool call IDs must be nonempty and unique")
+        ids.add(call["id"])
         try:
-            obj = json.loads(line[6:])
-        except json.JSONDecodeError:
-            continue  # skip a garbled frame rather than crash the REPL
-        if obj.get("usage"):
-            LAST_USAGE = obj["usage"]
-        if obj.get("error"):
-            sys.stdout.write(f"\n[server error: {obj['error']}]\n")
-            break
-        choices = obj.get("choices") or []
-        if not choices:  # usage-only / keep-alive frame has no choices
-            continue
-        finish = choices[0].get("finish_reason") or finish
-        delta = choices[0].get("delta", {})
-        r = delta.get("reasoning_content")
-        if r:  # think-blocks: show dim so slow local gen isn't a silent wait
-            if not reasoning:
-                sys.stdout.write(DIM)
-                reasoning = True
-            sys.stdout.write(r)
-            sys.stdout.flush()
-        c = delta.get("content")
-        if c:
-            if reasoning:
-                sys.stdout.write(RESET + "\n")
-                reasoning = False
-            content += c
-            sys.stdout.write(c)
-            sys.stdout.flush()
-        for tc in delta.get("tool_calls") or []:
-            slot = tool_calls.setdefault(tc["index"], {"id": "", "name": "", "arguments": ""})
-            slot["id"] = tc.get("id") or slot["id"]
-            fn = tc.get("function", {})
-            slot["name"] += fn.get("name") or ""
-            slot["arguments"] += fn.get("arguments") or ""
-    if reasoning:
-        sys.stdout.write(RESET)
-    if content:
-        sys.stdout.write("\n")
+            validate_args(call["function"]["name"], json.loads(call["function"]["arguments"]))
+        except (ValueError, TypeError, KeyError) as error:
+            raise ProtocolError(f"invalid tool call: {error}") from error
 
-    msg = {"role": "assistant", "content": content or None}
-    if tool_calls:
-        msg["tool_calls"] = [
-            {"id": t["id"] or f"call_{i}", "type": "function",
-             "function": {"name": t["name"], "arguments": t["arguments"]}}
-            for i, t in sorted(tool_calls.items())]
-    resp.close()
-    return msg, finish
+
+def stream_completion(messages, tools=None, purpose="normal"):
+    global LAST_USAGE, TOKEN_SCALE
+    data, fingerprint, estimated = build_request(messages, tools, purpose)
+    request = urllib.request.Request(local_url(BASE_URL) + "/chat/completions", data=data, headers={"Content-Type": "application/json"})
+    cap = COMPACT_TOKENS if purpose == "compact" else REPLY_BYTES
+    content, slots, finish, marker, reasoning = "", {}, None, False, False
+    received = displayed_reasoning = 0
+    usage = None
+    try:
+        with HTTP.open(request, timeout=600) as response:
+            while True:
+                raw = response.readline(max(16384, cap * 4) + 1)
+                if not raw:
+                    break
+                received += len(raw)
+                if len(raw) > max(16384, cap * 4) or received > max(262144, cap * 1024):
+                    raise ProtocolError("stream/frame byte limit exceeded; executable output discarded")
+                line = raw.decode("utf-8").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    if line.startswith(("event:", "id:", "retry:")):
+                        continue
+                    raise ProtocolError("unexpected substantive stream frame")
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    marker = True
+                    break
+                try:
+                    obj = json.loads(body)
+                    if not isinstance(obj, dict) or obj.get("error"):
+                        raise ValueError(f"server error: {text_prefix(str(obj), 200)}")
+                    if obj.get("usage"):
+                        usage = obj["usage"]
+                    choices = obj.get("choices", [])
+                    if not choices:
+                        continue
+                    if len(choices) != 1:
+                        raise ValueError("one completion choice required")
+                    choice = choices[0]
+                    delta = choice.get("delta")
+                    delta = {} if delta is None else delta
+                    if not isinstance(delta, dict):
+                        raise ValueError("delta must be an object")
+                    reason = choice.get("finish_reason")
+                    if finish and (delta.get("content") or delta.get("tool_calls")):
+                        raise ValueError("output after finish marker")
+                    if reason:
+                        if reason not in {"stop", "tool_calls", "length", "max_tokens"}:
+                            raise ValueError(f"unsupported finish reason: {reason}")
+                        finish = reason
+                    thought = delta.get("reasoning_content")
+                    thought = "" if thought is None else thought
+                    if not isinstance(thought, str):
+                        raise ValueError("reasoning must be text")
+                    if thought and displayed_reasoning < cap:
+                        if not reasoning:
+                            sys.stdout.write(DIM)
+                            reasoning = True
+                        excerpt = text_prefix(thought, cap - displayed_reasoning)
+                        displayed_reasoning += len(excerpt.encode("utf-8"))
+                        sys.stdout.write(excerpt)
+                    text = delta.get("content")
+                    text = "" if text is None else text
+                    if not isinstance(text, str):
+                        raise ValueError("content must be text")
+                    if text:
+                        if reasoning:
+                            sys.stdout.write(RESET + "\n")
+                            reasoning = False
+                        content += text
+                        if purpose != "compact":
+                            sys.stdout.write(text_prefix(text, cap))
+                    frame_indexes = set()
+                    for call in delta.get("tool_calls") or []:
+                        index = call["index"]
+                        if type(index) is not int or not 0 <= index < MAX_CALLS or index in frame_indexes:
+                            raise ValueError("invalid or duplicate tool-call index")
+                        frame_indexes.add(index)
+                        slot = slots.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        if call.get("type", "function") != "function":
+                            raise ValueError("unsupported tool-call type")
+                        if call.get("id") is not None:
+                            if not isinstance(call["id"], str) or slot["id"] and call["id"] and slot["id"] != call["id"]:
+                                raise ValueError("tool-call ID changed during stream")
+                            slot["id"] = call["id"] or slot["id"]
+                        function = call.get("function")
+                        function = {} if function is None else function
+                        if not isinstance(function, dict):
+                            raise ValueError("tool function must be an object")
+                        for key in ("name", "arguments"):
+                            part = function.get(key)
+                            part = "" if part is None else part
+                            if not isinstance(part, str):
+                                raise ValueError("tool function fragments must be text")
+                            slot[key] += part
+                    if len(encoded({"content": content, "calls": slots})) > cap:
+                        raise ValueError("completion byte limit exceeded")
+                    sys.stdout.flush()
+                except (ValueError, TypeError, KeyError, AttributeError) as error:
+                    raise ProtocolError(f"invalid stream; no tools authorized: {error}") from error
+        if not finish and not marker:
+            raise ProtocolError("unexpected EOF without finish or [DONE]; incomplete calls discarded")
+        message = {"role": "assistant", "content": content or None}
+        if slots:
+            if sorted(slots) != list(range(len(slots))):
+                raise ProtocolError("noncontiguous tool-call indexes")
+            message["tool_calls"] = [{"id": slot["id"], "type": "function", "function": {"name": slot["name"], "arguments": slot["arguments"]}} for _, slot in sorted(slots.items())]
+        if len(encoded(message)) > cap:
+            raise ProtocolError("serialized completion exceeds the accepted growth bound")
+        capped = finish in {"length", "max_tokens"}
+        if not capped:
+            validate_calls(message.get("tool_calls", []))
+        if usage and isinstance(usage, dict) and type(usage.get("prompt_tokens")) is int and usage["prompt_tokens"] >= 0:
+            LAST_USAGE = {"fingerprint": fingerprint, "usage": usage, "estimated": estimated}
+            if usage["prompt_tokens"] > estimated:
+                TOKEN_SCALE *= usage["prompt_tokens"] / max(1, estimated) * 1.05
+        return message, "capped" if capped else "complete"
+    finally:
+        if reasoning:
+            sys.stdout.write(RESET)
+        if content or reasoning:
+            sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def chat(messages):
-    """Finish capped replies within three requests; never execute partial arguments."""
-    msg, finish = stream_completion(messages)
-    calls = msg.get("tool_calls", [])
-    if finish not in ("length", "max_tokens"):
-        return msg
+    message, status = stream_completion(messages)
+    if status == "complete":
+        return message
+    calls = message.get("tool_calls", [])
     if len(calls) > 1:
-        return {"role": "assistant", "content": "[completion truncated: multiple tool calls discarded; retry separately]"}
-    fragment = calls[0]["function"]["arguments"] if calls else (msg["content"] or "")
+        return {"role": "assistant", "content": "[completion capped: multiple calls discarded; retry separately]"}
+    if calls and (not calls[0]["id"] or calls[0]["function"]["name"] not in TOOL_IMPL):
+        raise ProtocolError("capped call has incomplete identity; discarded without continuation")
+    fragment = calls[0]["function"]["arguments"] if calls else message["content"] or ""
     for _ in range(2):
-        instruction = ("Continue the unfinished JSON arguments exactly where they stopped. "
-                       "Output only the remaining JSON, with no fence, repetition or tool call."
-                       if calls else "Continue exactly where you stopped. Output only the continuation; do not repeat it.")
-        more, finish = stream_completion(messages + [
-            {"role": "assistant", "content": fragment},
-            {"role": "user", "content": instruction}], tools=[])
+        instruction = "Continue only the unfinished JSON arguments, no repetition, fence or tools." if calls else "Continue the unfinished text without repetition or tools."
+        more, status = stream_completion(messages + [{"role": "assistant", "content": fragment}, {"role": "user", "content": instruction, "_generated": True}], tools=[])
         if more.get("tool_calls"):
             break
         fragment += more["content"] or ""
-        if finish not in ("length", "max_tokens"):
+        if len(fragment.encode("utf-8")) > REPLY_BYTES:
+            break
+        if status == "complete":
             if calls:
-                try:
-                    args = json.loads(fragment)
-                    if not isinstance(args, dict):
-                        raise ValueError("arguments must be an object")
-                except (ValueError, TypeError):
-                    break
                 calls[0]["function"]["arguments"] = fragment
+                validate_calls(calls)
             else:
-                msg["content"] = fragment
-            return msg
-    return {"role": "assistant", "content":
-            ("[completion truncated: tool arguments discarded; retry the call]" if calls else
-             fragment + "\n[completion still truncated after three requests]")}
+                message["content"] = fragment
+            if len(encoded(message)) <= REPLY_BYTES:
+                return message
+            break
+    return {"role": "assistant", "content": "[completion still capped: incomplete output discarded; retry a smaller request]"}
 
 
-def resolve_ctx_budget():
-    """Size the conversation budget to the server's real context window (~80%, leaving
-    headroom so a long reasoning turn isn't truncated). Explicit FAMILIAR_CTX_TOKENS wins;
-    safe fallback if the server can't be probed. Returns (budget_tokens, server_ctx|None)."""
-    override = os.environ.get("FAMILIAR_CTX_TOKENS")
-    if override:
-        return int(override), None
-    try:
-        with urllib.request.urlopen(BASE_URL.rsplit("/v1", 1)[0] + "/props", timeout=2) as r:
-            props = json.load(r)
-        n = (props.get("default_generation_settings") or {}).get("n_ctx") or props.get("n_ctx")
-        if n:
-            return int(int(n) * 0.8), int(n)
-    except Exception:  # server down or /props unavailable — fall back
-        pass
-    return 55000, None
+def receipt(call, content):
+    return {"role": "tool", "tool_call_id": call["id"], "content": content}
 
 
-def context_chars(messages):
-    return sum(len(json.dumps(m)) for m in messages)
+def call_key(name, args):
+    key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+    if name == "read_file" and isinstance(args.get("path"), str):
+        try:
+            key += (file_signature(args["path"]),)
+        except OSError:
+            pass
+    return key
 
 
-def est_tokens(messages):
-    return context_chars(messages) // 3  # ~3 chars/token, matches CTX_CHARS
+def pause(reason):
+    STATE["pause"] = str(reason)
+    print(f"Context paused: {reason}. No messages discarded. Use /compact, /new, or correct the context settings.")
 
 
-def trim(messages):
-    # crude char-count trim, summarize-on-trim if quality suffers. Keeps [0] system
-    # and [1] the task; drops tool results with their tool_calls message (orphans 400 the server).
-    dropped = 0
-    while context_chars(messages) > CTX_CHARS and len(messages) > 4:
-        del messages[2]
-        dropped += 1
-        while len(messages) > 2 and messages[2]["role"] == "tool":
-            del messages[2]
-            dropped += 1
-    if dropped:
-        _READ_SEEN.clear()  # a dropped read is no longer in context — allow re-reading it
-        print(f"{DIM}⋯ context full — dropped {dropped} old message(s) to stay under "
-              f"{CTX_CHARS // 3 // 1000}k tokens{RESET}")
-    return dropped
-
-
-MUTATORS = {"write_file", "edit_file", "multi_edit"}
-
-
-def active_tools():
-    return [t for t in TOOLS if t["function"]["name"] not in MUTATORS] if PLAN else TOOLS
+def close_open_group(messages, start):
+    index = len(messages) - 1
+    while index >= start and messages[index]["role"] == "tool":
+        index -= 1
+    if index < start:
+        return
+    calls = messages[index].get("tool_calls") or []
+    finished = len(messages) - index - 1
+    for i, call in enumerate(calls[finished:]):
+        messages.append(receipt(call, "CANCELED: no completed receipt; outcome uncertain, inspect before retrying" if i == 0 else "NOT RUN: previous call interrupted"))
 
 
 def agent_turn(messages, user_input):
-    messages.append({"role": "user", "content": user_input})
-    # loop-breakers for a weak model — `edited`/`verified` gate the verify nudge
-    # (once), `recent_keys` catches consecutive and alternating repeated calls.
-    edited = verified = nudged = False
-    recent_keys = []
+    start = len(messages)
+    try:
+        return _agent_turn(messages, user_input)
+    finally:
+        close_open_group(messages, start)
+
+
+def _agent_turn(messages, user_input):
+    assert_pairs(messages)
+    if STATE["pause"].startswith("server context overflow"):
+        STATE["draft"] = user_input
+        pause(STATE["pause"])
+        return
+    proposed = messages + [{"role": "user", "content": user_input}]
+    try:
+        admission(proposed)
+    except ContextPause as error:
+        STATE["draft"] = user_input
+        pause(error)
+        print("Draft retained in memory, not sent or executed; /draft shows it.")
+        return
+    STATE["pause"], STATE["draft"] = "", None
+    messages.append(proposed[-1])
     for _ in range(MAX_STEPS):
-        trim(messages)
-        msg = chat(messages)
-        messages.append(msg)
-        if not msg.get("tool_calls"):
-            if edited and not verified and not nudged:  # don't stop on unverified edits
-                nudged = True
-                messages.append({"role": "user", "content":
-                    "You changed files but ran nothing to check them. Run the build or a test "
-                    "(bash), or state why no check applies — then give your final summary."})
-                continue
+        try:
+            message = chat(messages)
+        except ContextPause as error:
+            pause(error)
             return
-        for tc in msg["tool_calls"]:
-            name = tc["function"]["name"]
-            try:
-                args = json.loads(tc["function"]["arguments"] or "{}")
-                if not isinstance(args, dict):
-                    raise ValueError("tool arguments must be an object")
-            except (ValueError, TypeError) as e:
-                result = f"ERROR: malformed tool arguments: {e}"
-            else:
-                key = (name, json.dumps(args, sort_keys=True))
-                if name == "read_file" and isinstance(args.get("path"), str):
-                    try:
-                        stat = os.stat(args["path"])
-                        key += (stat.st_mtime_ns, stat.st_size)
-                    except OSError:
-                        pass
-                if key in recent_keys:
-                    result = ("[skipped: identical to a recent call. Reuse its earlier observation. Repeating it changes "
-                              "nothing — make a different change, verify, or stop and summarize.]")
+        group_start = len(messages)
+        messages.append(message)
+        calls = message.get("tool_calls") or []
+        if not calls:
+            if STATE["pending_check"] and not STATE["nudged"] and not PLAN:
+                nudge = {"role": "user", "content": "Files changed without a completed check. Run a relevant check, report its observed exit status, or explain why no check applies. Then summarize.", "_generated": True}
+                try:
+                    admission(messages + [nudge])
+                except ContextPause as error:
+                    pause(error)
+                    return
+                STATE["nudged"] = True
+                messages.append(nudge)
+                continue
+            if STATE["pending_check"]:
+                print("[latest command after edits: " + STATE["last_check"] + "; assess its relevance]" if STATE["last_check"] else "[files changed; no completed check recorded]")
+            return
+        current, result, started = 0, None, False
+        remaining = MAX_TOOL_OUTPUT
+        try:
+            validate_calls(calls)
+            for current, call in enumerate(calls):
+                result, started = None, False
+                rest = [receipt(c, "NOT RUN: context paused before dispatch") for c in calls[current + 1:]]
+                budget = remaining - sum(len(encoded(r)) for r in rest) - 192
+                if budget < 512:
+                    raise ContextPause("tool-result group output budget exhausted")
+                admission(messages + [receipt(call, "x" * budget)] + rest, future=False)
+                name = call["function"]["name"]
+                args = json.loads(call["function"]["arguments"])
+                key = call_key(name, args)
+                if key in STATE["recent"]:
+                    result = "[skipped: identical to a recent call; reuse the earlier observation, change approach, verify or stop]"
                 else:
-                    preview = args.get("command") or args.get("path") or ""
-                    print(f"{DIM}→ {name} {preview}{RESET}")
-                    result = run_tool(name, args)
+                    print(f"{DIM}→ {name} {text_prefix(args.get('command') or args.get('path') or '', 160)}{RESET}")
+                    started = True
+                    STATE["recent"].append(key)
+                    STATE["recent"] = STATE["recent"][-4:]
+                    pending_before = STATE["pending_check"]
+                    if name in MUTATORS and not PLAN:
+                        STATE["pending_check"] = True
+                    result = run_tool(name, args, budget=budget)
+                    if name in MUTATORS and result.startswith("ERROR"):
+                        STATE["pending_check"] = pending_before
                     if name in MUTATORS and not result.startswith("ERROR"):
-                        edited, verified = True, False
-                        # Changed files justify another verification, but do not
-                        # forget repeated writes that alternate between two paths.
-                        recent_keys = [k for k in recent_keys if k[0] in MUTATORS]
-                    elif name == "bash" and edited:
-                        verified = True
-                recent_keys.append(key)
-                recent_keys = recent_keys[-4:]
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-    messages.append({"role": "user", "content":
-                     "Step limit reached. Summarize progress and stop."})
-    messages.append(chat(messages))
+                        STATE["nudged"] = False
+                        STATE["last_check"] = None
+                        STATE["recent"] = [k for k in STATE["recent"] if k[0] in MUTATORS]
+                    elif name == "bash" and STATE["pending_check"]:
+                        STATE["nudged"] = True
+                        STATE["last_check"] = text_prefix(args["command"], 160) + " — " + result.splitlines()[0]
+                messages.append(receipt(call, result))
+                remaining -= len(encoded(messages[-1]))
+                if result.startswith("CANCELED"):
+                    current += 1
+                    for unrun in calls[current:]:
+                        messages.append(receipt(unrun, "NOT RUN: user canceled the preceding command"))
+                    return
+        except (KeyboardInterrupt, ContextPause, ProtocolError) as error:
+            existing = len(messages) - group_start - 1
+            for index, call in enumerate(calls[existing:], existing):
+                note = result if index == current and result is not None else ("CANCELED: outcome uncertain; inspect files/command effects before retrying" if index == current and started else "NOT RUN: interrupted or paused before dispatch")
+                messages.append(receipt(call, note))
+            assert_pairs(messages)
+            if isinstance(error, ContextPause):
+                pause(error)
+            elif isinstance(error, KeyboardInterrupt):
+                print("Interrupted; completed effects retained and remaining calls closed. No retry.")
+            else:
+                print(f"Invalid tool group: {error}")
+            return
+    stopped = {"role": "assistant", "content": f"[stopped at {MAX_STEPS} steps; no further tools or summary request. Review results before continuing.]"}
+    messages.append(stopped)
+    print(stopped["content"])
 
 
-# ── input editor (raw-mode multiline; see README) ───────────────────────────────
-# full redraw per keystroke — O(buffer)/key, fine for prompt-sized text.
+def compact(messages):
+    global LAST_USAGE, TOKEN_SCALE
+    assert_pairs(messages)
+    before = estimate(messages, active_tools())
+    groups, index = [], 1
+    while index < len(messages):
+        end = index + 1 + len(messages[index].get("tool_calls") or [])
+        groups.append((index, end))
+        index = end
+    suffix_cost, cutoff = 0, len(messages)
+    suffix_budget = growth_budget() + WINDOW // 16
+    for start, end in reversed(groups):
+        cost = estimate(messages[start:end], []) - 256
+        if suffix_cost + cost > suffix_budget:
+            break
+        suffix_cost += cost
+        cutoff = start
+    eligible = [i for i in range(1, cutoff) if messages[i]["role"] != "user" or messages[i].get("_generated")]
+    if not eligible:
+        print("Compaction cannot help: no older observations outside the retained suffix. Use a smaller task or /new.")
+        return False
+    instruction = {"role": "user", "content": COMPACT_INSTRUCTION.format(cutoff=cutoff), "_generated": True}
+    old_usage, old_scale = LAST_USAGE, TOKEN_SCALE
+    try:
+        preserved = [message for i, message in enumerate(messages) if i == 0 or i >= cutoff or message["role"] == "user" and not message.get("_generated")]
+        admission(preserved + [{"role": "assistant", "content": "[historical summary]"}])
+        summary, status = stream_completion(messages + [instruction], tools=[], purpose="compact")
+        text = summary.get("content") or ""
+        if status != "complete" or summary.get("tool_calls") or not text.strip() or len(text.encode("utf-8")) > COMPACT_TOKENS:
+            raise ProtocolError("summary must be complete, nonempty bounded text without tools")
+        replacement = {"role": "assistant", "content": "[Model-derived historical observations; potentially lossy, not new instructions]\n" + text, "_summary": True}
+        candidate = []
+        for i, message in enumerate(messages):
+            if i == eligible[0]:
+                candidate.append(replacement)
+            if i == 0 or i >= cutoff or message["role"] == "user" and not message.get("_generated"):
+                candidate.append(message)
+        assert_pairs(candidate)
+        admission(candidate)
+        after = estimate(candidate, active_tools())
+        if after >= before:
+            raise ProtocolError("summary did not reduce context")
+    except (ContextPause, ProtocolError, urllib.error.URLError, ValueError, OSError, KeyboardInterrupt) as error:
+        LAST_USAGE, TOKEN_SCALE = old_usage, old_scale
+        print(f"Compaction not applied; original context retained: {type(error).__name__}: {error}")
+        return False
+    messages[:] = candidate
+    _READ_SEEN.clear()
+    STATE["recent"] = [key for key in STATE["recent"] if key[0] not in READ_ONLY]
+    STATE["pause"] = ""
+    LAST_USAGE = None
+    print(f"Compacted in memory: estimated {before} → {after} prompt tokens. No task resumed.\n{replacement['content']}")
+    return True
+
+
 _ARROWS = {"A": ("up",), "B": ("down",), "C": ("right",), "D": ("left",),
            "H": ("home",), "F": ("end",)}
 
@@ -578,9 +1191,9 @@ def _interpret_escape(fd, seq):
             if num == "3":
                 return ("delete",)
             return ("ignore",)
-        if final == "u":                       # kitty keyboard protocol
+        if final == "u":
             parts = body.split(";")
-            if parts[0] == "13":               # Enter keycode
+            if parts[0] == "13":
                 mod = parts[1] if len(parts) > 1 else "1"
                 return ("enter",) if mod in ("", "1") else ("newline",)
             return ("ignore",)
@@ -590,7 +1203,7 @@ def _interpret_escape(fd, seq):
 
 def _read_escape(fd):
     if not select.select([fd], [], [], 0.02)[0]:
-        return None  # lone ESC
+        return None
     c = os.read(fd, 1)
     if c == b"[":
         params = b""
@@ -619,22 +1232,22 @@ def _read_key(fd):
     if c in (0x7f, 0x08):
         return ("backspace",)
     if c == 0x03:
-        return ("interrupt",)   # Ctrl-C
+        return ("interrupt",)
     if c == 0x04:
-        return ("eof",)         # Ctrl-D
+        return ("eof",)
     if c == 0x15:
-        return ("kill",)        # Ctrl-U
+        return ("kill",)
     if c == 0x01:
-        return ("home",)        # Ctrl-A
+        return ("home",)
     if c == 0x05:
-        return ("end",)         # Ctrl-E
+        return ("end",)
     if c == 0x0c:
-        return ("clear",)       # Ctrl-L
+        return ("clear",)
     if c == 0x17:
-        return ("word-back",)   # Ctrl-W
+        return ("word-back",)
     if c < 0x20:
         return ("ignore",)
-    if c >= 0x80:               # UTF-8 multibyte
+    if c >= 0x80:
         n = 3 if c >= 0xf0 else 2 if c >= 0xe0 else 1
         try:
             return ("char", (bytes([c]) + os.read(fd, n)).decode("utf-8"))
@@ -709,12 +1322,12 @@ def _edit(prompt, history):
             sys.stdout.write("\r\n")
             sys.stdout.flush()
             return buf
-        if action == "interrupt":                  # Ctrl-C abandons the line
+        if action == "interrupt":
             sys.stdout.write("^C\r\n")
             sys.stdout.flush()
             buf, cur, prev = "", 0, _render(prompt, "", 0, 0)
             continue
-        if action == "eof":                        # Ctrl-D on empty line quits
+        if action == "eof":
             sys.stdout.write("\r\n")
             sys.stdout.flush()
             raise EOFError
@@ -726,459 +1339,753 @@ def _edit(prompt, history):
 
 
 def load_history():
-    # JSON-per-line so multi-line prompts round-trip; keep last 1000 in memory
+    if not HISTORY_ENABLED:
+        return []
     try:
-        with open(HISTFILE, errors="replace") as f:
+        with open(HISTFILE, encoding="utf-8") as source:
             out = []
-            for line in f:
+            for line in source:
                 try:
-                    out.append(json.loads(line))
+                    value = json.loads(line)
+                    if isinstance(value, str):
+                        out.append(value)
+                        if len(out) > 1000:
+                            del out[0]
                 except ValueError:
                     pass
-            return out[-1000:]
-    except FileNotFoundError:
+            return out
+    except (OSError, UnicodeError):
         return []
 
 
 def save_history(line):
-    if line.startswith("/"):  # don't clutter recall with slash commands
+    if not HISTORY_ENABLED or line.startswith("/"):
         return
     try:
-        with open(HISTFILE, "a") as f:
-            f.write(json.dumps(line) + "\n")
+        with open(HISTFILE, "a", encoding="utf-8") as destination:
+            destination.write(json.dumps(line) + "\n")
     except OSError:
         pass
 
 
 def read_input(prompt, history):
-    if not (_RAW_OK and sys.stdin.isatty()):
+    if not (_RAW_OK and sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"):
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
         line = sys.stdin.readline()
         if not line:
             raise EOFError
-        return line.rstrip("\n")
+        return line.rstrip("\r\n")
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        sys.stdout.write("\x1b[?2004h\x1b[>1u")  # bracketed paste + kitty keyboard
+        sys.stdout.write("\x1b[?2004h\x1b[>1u")
         sys.stdout.flush()
         return _edit(prompt, history)
     finally:
-        sys.stdout.write("\x1b[<u\x1b[?2004l")   # pop kitty flags, disable paste mode
-        sys.stdout.flush()
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        try:
+            sys.stdout.write("\x1b[<u\x1b[?2004l")
+            sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def format_meter(messages):
-    budget = CTX_CHARS // 3
-    if LAST_USAGE:  # ground truth from the server's last turn beats the char estimate
-        used = LAST_USAGE.get("prompt_tokens", 0) + LAST_USAGE.get("completion_tokens", 0)
-        mark = ""
-    else:
-        used, mark = est_tokens(messages), "~"
-    pct = used / budget if budget else 0
-    note = (" · dropping oldest turns to fit" if pct >= 0.9
-            else " · nearing limit" if pct >= 0.75 else "")
-    return f"ctx {mark}{used / 1000:.1f}k / {budget // 1000}k tokens ({pct:.0%}){note}"
+    used = estimate(messages, active_tools())
+    return f"ctx estimated {used / 1000:.1f}k / {WINDOW / 1000:g}k prompt tokens · {'Plan' if PLAN else 'Normal'}" + (f" · paused: {STATE['pause']}" if STATE["pause"] else "")
 
 
 def cmd_tokens(messages):
-    budget = CTX_CHARS // 3
-    used = est_tokens(messages)
-    pct = used / budget if budget else 0
-    by_role = {}
-    for m in messages:
-        by_role[m["role"]] = by_role.get(m["role"], 0) + len(json.dumps(m)) // 3
-    print(f"{DIM}budget {budget // 1000}k tokens (FAMILIAR_CTX_TOKENS); server hard cap "
-          f"set by -c in serve.sh{RESET}")
-    print(f"  estimate  {used:>6} tokens (~{pct:.0%} of budget) across {len(messages)} messages")
+    used = estimate(messages, active_tools())
+    print(format_meter(messages))
+    print(f"  completion reserve {MAX_TOKENS}; compaction reply reserve {COMPACT_TOKENS}; safety margin {MARGIN}")
+    print(f"  bounded next-response/tool growth {growth_budget()}; ordinary free {max(0, WINDOW - used - MAX_TOKENS - MARGIN)}")
+    print("  fallback: serialized UTF-8 bytes plus framing, calibrated upward; model tokenization may differ")
     if LAST_USAGE:
-        print(f"  measured  {LAST_USAGE.get('prompt_tokens', 0):>6} prompt + "
-              f"{LAST_USAGE.get('completion_tokens', 0)} completion (server, last turn)")
-    print(f"  free      {max(budget - used, 0):>6} tokens before oldest turns start dropping")
-    for role, n in by_role.items():
-        print(f"    {role:<10} {n:>6}")
+        usage = LAST_USAGE["usage"]
+        print(f"  last request {LAST_USAGE['fingerprint'][:12]} measured: {usage.get('prompt_tokens', 0)} prompt + {usage.get('completion_tokens', 'unknown')} completion; not current context usage")
+    if STATE["draft"] is not None:
+        print("  an unsent draft is retained in memory (/draft)")
+    try:
+        admission(messages)
+    except ContextPause as error:
+        print(f"  pause reason: {error}")
 
 
-HELP = f"""{BOLD}commands{RESET}
-  /new      clear the conversation (keeps the system prompt)
-  /plan     toggle read-only plan mode (explore & propose, no edits)
-  /tokens   detailed context-usage breakdown
+HELP = """commands
+  /new      clear in-memory conversation, keeps selected mode
+  /plan     toggle Normal / Plan (Plan permits only native reads and search)
+  /compact  summarize older observations in memory, then return to the prompt
+  /tokens   estimated current budget and last-request measured usage
+  /draft    show an unsent rejected draft
   /help     this help
-  /quit     exit (also ctrl-d on an empty line)
-{BOLD}keys{RESET}
-  Enter                     submit
-  Shift+Enter / Alt+Enter   newline (multi-line prompt)
-  paste                     multi-line paste stays intact — no early submit
-  ↑ / ↓                     recall previous prompts
-  Ctrl+U clear line · Ctrl+W delete word · Ctrl+C abandon line"""
+  /quit     exit (also EOF / Ctrl-D on an empty line)
+Unix terminal: Enter submits; Alt+Enter inserts a newline; Shift+Enter needs a
+compatible terminal. Paste and up/down history supported. Ctrl-C abandons input.
+Windows/non-TTY: plain one-line input; EOF exits, Ctrl-C cancels.
+Input history stores private user prompts by default; FAMILIAR_HISTORY=0 disables
+all history file reads/writes. Conversations and summaries are never saved."""
+
+
+def new_conversation():
+    global LAST_USAGE
+    LAST_USAGE = None
+    _READ_SEEN.clear()
+    _FILE_VERSIONS.clear()
+    STATE.update(pending_check=False, nudged=False, last_check=None, recent=[], draft=None, pause="")
+    return [system_message()]
 
 
 def repl():
-    global LAST_USAGE, CTX_CHARS, PLAN
-    budget, server_ctx = resolve_ctx_budget()
-    CTX_CHARS = budget * 3
-    ctx_note = (f"ctx {budget // 1000}k / {server_ctx // 1000}k window" if server_ctx
-                else f"ctx {budget // 1000}k")
-    print(f"{BOLD}Familiar{RESET} — local coding agent")
-    print(f"{DIM}server {BASE_URL} · cwd {os.getcwd()} · {ctx_note} · /help · ctrl-d quits{RESET}")
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    global PLAN, LAST_USAGE
+    print(f"{BOLD}The Wizard's Familiar{RESET} — local coding agent")
+    print(f"{DIM}server {BASE_URL} · cwd {os.getcwd()} · window {WINDOW} · /help{RESET}")
+    if HISTORY_ENABLED:
+        print("Input history is enabled: private prompt text is stored in " + HISTFILE + "; FAMILIAR_HISTORY=0 disables it.")
+    messages = new_conversation()
     history = load_history()
-    while True:
-        try:
-            print(f"\n{DIM}{format_meter(messages)}{RESET}")
-            user_input = read_input("plan › " if PLAN else "› ", history).strip()
-        except EOFError:
-            print()
-            return
-        if not user_input:
-            continue
-        history.append(user_input)
-        save_history(user_input)
-        if user_input in ("/quit", "/exit"):
-            return
-        if user_input == "/new":
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            LAST_USAGE = None  # else the meter keeps showing the pre-clear token count
-            _READ_SEEN.clear()
-            print(f"{DIM}context cleared{RESET}")
-            continue
-        if user_input == "/plan":
-            PLAN = not PLAN
-            messages[0]["content"] = SYSTEM_PROMPT + (PLAN_SUFFIX if PLAN else "")
-            print(f"{DIM}plan mode {'on — read-only, edits disabled' if PLAN else 'off'}{RESET}")
-            continue
-        if user_input == "/tokens":
-            cmd_tokens(messages)
-            continue
-        if user_input == "/help":
-            print(HELP)
-            continue
-        try:
-            agent_turn(messages, user_input)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")[:300]
-            print(f"\nserver rejected the request ({e.code}): {body}\n"
-                  "likely context overflow — /new resets, or lower FAMILIAR_CTX_TOKENS")
-        except urllib.error.URLError as e:
-            print(f"\ncannot reach {BASE_URL} ({e.reason}) — start the model: ./serve.sh")
-        except KeyboardInterrupt:
-            print(f"\n{DIM}interrupted{RESET}")
-            messages.append({"role": "user", "content": "[interrupted by user]"})
+    try:
+        while True:
+            try:
+                print("\n" + format_meter(messages))
+                user_input = read_input("plan › " if PLAN else "› ", history)
+            except EOFError:
+                print()
+                return
+            except KeyboardInterrupt:
+                print("\nInput canceled.")
+                continue
+            if not user_input.strip():
+                continue
+            history.append(user_input)
+            history[:] = history[-1000:]
+            save_history(user_input)
+            if user_input in ("/quit", "/exit"):
+                return
+            if user_input == "/new":
+                messages = new_conversation()
+                print("Conversation cleared in memory.")
+                continue
+            if user_input == "/plan":
+                PLAN = not PLAN
+                messages[0] = system_message()
+                LAST_USAGE = None
+                print("Plan: native read/search only." if PLAN else "Normal: execution and edits enabled.")
+                continue
+            if user_input == "/tokens":
+                cmd_tokens(messages)
+                continue
+            if user_input == "/draft":
+                print(STATE["draft"] if STATE["draft"] is not None else "No unsent draft.")
+                continue
+            if user_input == "/help":
+                print(HELP)
+                continue
+            try:
+                if user_input == "/compact":
+                    compact(messages)
+                elif user_input.startswith("/"):
+                    print("Unknown command; /help lists commands.")
+                else:
+                    agent_turn(messages, user_input)
+            except urllib.error.HTTPError as error:
+                try:
+                    body = error.read(512).decode("utf-8", errors="replace")
+                finally:
+                    error.close()
+                if "context" in body.lower() and any(word in body.lower() for word in ("exceed", "length", "overflow", "limit")):
+                    pause("server context overflow; /compact, /new, or lower the configured limit")
+                else:
+                    print(f"Server rejected request ({error.code}): {body}. No automatic retry. Check FAMILIAR_TOKEN_FIELD / FAMILIAR_STREAM_USAGE compatibility.")
+            except (urllib.error.URLError, OSError, ProtocolError, ValueError) as error:
+                print(f"Request stopped: {type(error).__name__}: {error}. Incomplete tools discarded; no automatic retry.")
+            except KeyboardInterrupt:
+                print("\nInterrupted. No automatic retry.")
+    finally:
+        messages.clear()
+        history.clear()
+        new_conversation()
 
 
 def selftest():
-    """Mock the server, verify the full loop: tool call → execution → final answer."""
-    global BASE_URL, CTX_CHARS, LAST_USAGE, HISTFILE, PLAN
-    import http.server
-    import tempfile
-    import threading
-
-    probe = os.path.join(tempfile.mkdtemp(), "probe.txt")
-
-    class Mock(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            if any(m["role"] == "tool" for m in body["messages"]):
-                chunks = [{"delta": {"content": "done: "}}, {"delta": {"content": "wrote probe"}}]
-            else:
-                args = json.dumps({"path": probe, "content": "hello from familiar"})
-                chunks = [{"delta": {"tool_calls": [{"index": 0, "id": "call_1",
-                          "function": {"name": "write_file", "arguments": args}}]}}]
-            for c in chunks:
-                self.wfile.write(f"data: {json.dumps({'choices': [c]})}\n\n".encode())
-            usage = {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 7}}
-            self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())  # usage-only frame
-            self.wfile.write(b"data: [DONE]\n\n")
-
-        def do_GET(self):  # /props for resolve_ctx_budget()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"default_generation_settings": {"n_ctx": 10000}}).encode())
-
-        def log_message(self, *a):
-            pass
-
-    srv = http.server.HTTPServer(("127.0.0.1", 0), Mock)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    BASE_URL = f"http://127.0.0.1:{srv.server_port}/v1"
-
-    # context budget resolution: probe (80% of server n_ctx), env override, fallback
-    os.environ.pop("FAMILIAR_CTX_TOKENS", None)
-    assert resolve_ctx_budget() == (8000, 10000), "budget should be 80% of probed n_ctx"
-    os.environ["FAMILIAR_CTX_TOKENS"] = "12345"
-    assert resolve_ctx_budget() == (12345, None), "env override should win"
-    os.environ.pop("FAMILIAR_CTX_TOKENS", None)
-    _saved_url, BASE_URL = BASE_URL, "http://127.0.0.1:1/v1"  # unreachable
-    assert resolve_ctx_budget() == (55000, None), "fallback when server unreachable"
-    BASE_URL = _saved_url
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    agent_turn(messages, "create the probe file")
-    with open(probe) as f:
-        assert f.read() == "hello from familiar", "tool execution failed"
-    assert messages[-1]["content"] == "done: wrote probe", "final answer missing"
-    assert any(m["role"] == "tool" for m in messages), "tool result not in transcript"
-    assert any("ran nothing to check" in (m.get("content") or "")
-               for m in messages if m["role"] == "user"), "verify-after-edit nudge should fire"
-
-    # consecutive-duplicate breaker: an identical back-to-back call is skipped, ending the loop
-    loopf = os.path.join(tempfile.mkdtemp(), "loop.txt")
-    tool_write_file(loopf, "x\n")
-    _READ_SEEN.clear()
-
-    class LoopMock(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            tools = [m for m in body["messages"] if m["role"] == "tool"]
-            if tools and "skipped: identical" in tools[-1]["content"]:
-                chunks = [{"delta": {"content": "stopped"}}]  # loop broken → answer
-            else:  # keep issuing the same read — a stuck model
-                args = json.dumps({"path": loopf})
-                chunks = [{"delta": {"tool_calls": [{"index": 0, "id": "call_r",
-                          "function": {"name": "read_file", "arguments": args}}]}}]
-            for c in chunks:
-                self.wfile.write(f"data: {json.dumps({'choices': [c]})}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-
-        def log_message(self, *a):
-            pass
-
-    srv2 = http.server.HTTPServer(("127.0.0.1", 0), LoopMock)
-    threading.Thread(target=srv2.serve_forever, daemon=True).start()
-    BASE_URL = f"http://127.0.0.1:{srv2.server_port}/v1"
-    m2 = [{"role": "system", "content": "s"}]
-    agent_turn(m2, "read it")
-    assert m2[-1]["content"] == "stopped", "loop should end once the dup call is skipped"
-    assert any("skipped: identical" in (m.get("content") or "") for m in m2), "dup not skipped"
-    BASE_URL = _saved_url
-
-    # usage-only frame captured (also exercises the empty-choices guard in chat())
-    assert LAST_USAGE and LAST_USAGE["prompt_tokens"] == 100, "server usage not captured"
-    assert not format_meter(messages).startswith("ctx ~"), "meter should use measured tokens"
-
-    # Alternating calls and equivalent JSON keys cannot bypass the breaker.
-    from unittest.mock import patch
+    import contextlib
     import io
+    from unittest.mock import patch
+    real_connect = socket.socket.connect
 
-    def call(arguments):
-        return {"role": "assistant", "content": None, "tool_calls": [{
-            "id": "test", "function": {"name": "read_file", "arguments": arguments}}]}
+    def local_connect(sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6) and not ipaddress.ip_address(address[0]).is_loopback:
+            raise OSError("selftest blocks external network access")
+        return real_connect(sock, address)
 
-    done = {"role": "assistant", "content": "done"}
-    for script in ([call('{"path":"A"}'), call('{"path":"B"}'),
-                    call('{"path":"A"}'), call('{"path":"B"}'), done],
-                   [call('{"path":"A", "offset":1}'),
-                    call('{"offset": 1,"path": "A"}'), done]):
-        with patch.dict(globals(), chat=lambda m, it=iter(script): next(it)):
-            with patch.dict(globals(), run_tool=lambda name, args: "read " + args["path"]):
-                transcript = [{"role": "system", "content": "s"}]
-                agent_turn(transcript, "read")
-        results = [m["content"] for m in transcript if m["role"] == "tool"]
-        expected = 2 if len(script) == 5 else 1
-        assert sum(r.startswith("read ") for r in results) == expected
-        assert any("skipped: identical" in r for r in results)
-
-    def frame(delta, finish=None):
-        return ("data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}) + "\n\n").encode()
-
-    partial = {"tool_calls": [{"index": 0, "id": "call_test", "function": {
-        "name": "write_file", "arguments": '{"path":"a.txt","content":"hel'}}]}
-    with patch.object(urllib.request, "urlopen", side_effect=[
-            io.BytesIO(frame(partial, "length")),
-            io.BytesIO(frame({"content": 'lo"}'}, "stop"))]) as opener:
-        msg = chat([{"role": "user", "content": "write"}])
-        assert json.loads(msg["tool_calls"][0]["function"]["arguments"])["content"] == "hello"
-        assert json.loads(opener.call_args[0][0].data)["tools"] == []
-    for ending in (frame({"content": "bad JSON"}, "stop"), frame({"content": "x"}, "length")):
-        with patch.object(urllib.request, "urlopen", side_effect=[
-                io.BytesIO(frame(partial, "length")), io.BytesIO(ending), io.BytesIO(ending)]) as opener:
-            msg = chat([{"role": "user", "content": "write"}])
-            assert not msg.get("tool_calls"), "invalid or still-capped arguments must not execute"
-            assert opener.call_count <= 3
-
-    large = "HEAD\n" + "noise\n" * MAX_TOOL_OUTPUT + "TAIL failure\n"
-    with patch.dict(TOOL_IMPL, bash=lambda **kwargs: large):
-        excerpt = run_tool("bash", {})
-    assert excerpt.startswith("HEAD") and excerpt.endswith("TAIL failure\n")
-    assert "characters omitted" in excerpt and len(excerpt) <= MAX_TOOL_OUTPUT
-
-    # Alternating writes must still break after verification history is reset.
-    writes = []
-    for target in (probe, probe + "-other", probe):
-        msg = call(json.dumps({"path": target, "content": "same"}))
-        msg["tool_calls"][0]["function"]["name"] = "write_file"
-        writes.append(msg)
-    verify = call('{"command":"exit 0"}')
-    verify["tool_calls"][0]["function"]["name"] = "bash"
-    with patch.dict(globals(), chat=lambda m, it=iter(writes + [verify, done]): next(it)):
-        transcript = [{"role": "system", "content": "s"}]
-        agent_turn(transcript, "write")
-    assert sum("skipped: identical" in (m.get("content") or "") for m in transcript) == 1
-
-    # A file changed outside the edit tools may be read again with identical args.
-    tool_write_file(probe, "before")
-    reads = iter([call(json.dumps({"path": probe})), call(json.dumps({"path": probe})), done])
-    def changing_chat(transcript):
-        msg = next(reads)
-        if sum(m["role"] == "tool" for m in transcript) == 1 and msg.get("tool_calls"):
-            tool_write_file(probe, "changed externally")
-        return msg
-    with patch.dict(globals(), chat=changing_chat):
-        transcript = [{"role": "system", "content": "s"}]
-        agent_turn(transcript, "read")
-    assert any(m["role"] == "tool" and "changed externally" in m["content"] for m in transcript)
-    with patch.dict(globals(), chat=lambda m, it=iter([call("[]"), done]): next(it)):
-        transcript = [{"role": "system", "content": "s"}]
-        agent_turn(transcript, "read")
-    assert any("malformed tool arguments" in (m.get("content") or "") for m in transcript)
-
-    pyprobe = probe + ".py"
-    tool_write_file(pyprobe, "x = 1\n")
-    before = open(pyprobe, "rb").read()
-    for edit in (lambda: tool_edit_file(pyprobe, "x = 1", "x = ("),
-                 lambda: tool_edit_file(pyprobe, new="x = (", start_line=1),
-                 lambda: tool_multi_edit(pyprobe, [{"old": "1", "new": "("}]),
-                 lambda: tool_write_file(pyprobe, "x = (")):
-        assert edit().startswith("ERROR: invalid Python")
-        assert open(pyprobe, "rb").read() == before, "invalid Python changed the original bytes"
-
-    saved, CTX_CHARS = CTX_CHARS, 50
-    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "the task"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "t1"}]},
-            {"role": "tool", "tool_call_id": "t1", "content": "x" * 500},
-            {"role": "user", "content": "follow-up"}, {"role": "assistant", "content": "a"}]
-    trim(msgs)
-    CTX_CHARS = saved
-    assert msgs[1]["content"] == "the task", "trim dropped the original task"
-    for i, m in enumerate(msgs):
-        if m["role"] == "tool":
-            assert msgs[i - 1].get("tool_calls"), "trim orphaned a tool result"
-
-    assert "not found" in tool_edit_file(probe, "nope", "x")
-    tool_write_file(probe, "aa")
-    assert "2 times" in tool_edit_file(probe, "a", "b")
-
-    # line-range edit (fallback mode) and multi_edit (atomic)
-    tool_write_file(probe, "one\ntwo\nthree\n")
-    tool_edit_file(probe, new="TWO", start_line=2, end_line=2)
-    with open(probe) as f:
-        assert f.read() == "one\nTWO\nthree\n", "line-range replace"
-    tool_edit_file(probe, new="", start_line=1, end_line=1)  # delete line 1
-    with open(probe) as f:
-        assert f.read() == "TWO\nthree\n", "line-range delete"
-    tool_write_file(probe, "aXbYc")
-    assert "3 edits" in tool_multi_edit(probe, [{"old": "X", "new": "1"}, {"old": "Y", "new": "2"}, {"old": "c", "new": "3"}])
-    with open(probe) as f:
-        assert f.read() == "a1b2" "3", "multi_edit applied in order"
-    tool_write_file(probe, "aXbXc")  # ambiguous 2nd edit → atomic abort, no write
-    assert "nothing written" in tool_multi_edit(probe, [{"old": "a", "new": "Z"}, {"old": "X", "new": "1"}])
-    with open(probe) as f:
-        assert f.read() == "aXbXc", "multi_edit atomic: no partial write"
-
-    assert tool_bash("exit 3").startswith("exit 3")
-    assert "blocked" in tool_bash("git commit -m hi")
-    assert "blocked" in tool_bash("cd /tmp && git merge feat/x")
-    assert "blocked" in tool_bash("git checkout main")
-    assert "blocked" in tool_bash("git branch -D old")
-    assert "blocked" in tool_bash("git -C /tmp push origin main")
-    # Read-only output can contain "blocked", including a real commit message.
-    # The exit prefix proves the command reached the shell instead of the guard.
-    assert tool_bash("git log -1").startswith("exit ")
-    assert tool_bash("git -C /tmp status && git branch --show-current").startswith("exit ")
-    assert "truncated" not in tool_read_file(probe)
-
-    # plan mode: mutators vanish from the tool list and are hard-blocked at execution
-    PLAN = True
-    assert all(t["function"]["name"] not in MUTATORS for t in active_tools()), "plan hides mutators"
-    assert "read-only" in run_tool("write_file", {"path": probe, "content": "x"}), "plan blocks writes"
-    assert "blocked" not in run_tool("bash", {"command": "echo ok"}), "plan keeps bash for exploring"
-    PLAN = False
-    assert any(t["function"]["name"] == "write_file" for t in active_tools()), "normal mode restores mutators"
-
-    # reading a directory lists it instead of erroring (common weak-model mistake)
-    d = os.path.dirname(probe)
-    out = tool_read_file(d)
-    assert "is a directory" in out and os.path.basename(probe) in out, "dir read should list entries"
-
-    # re-read guard: unchanged re-read is deduped; a real on-disk change re-enables the read
-    assert "already read" in tool_read_file(probe), "unchanged re-read should be deduped"
-    tool_write_file(probe, "changed on disk\n")
-    assert "already read" not in tool_read_file(probe), "read after change should return content"
-
-    # bare `cat file` routes through read_file (line numbers + dedup); pipes/flags/globs don't
-    tool_write_file(probe, "L1\nL2\n")
-    _READ_SEEN.clear()
-    assert "1\tL1" in tool_bash(f"cat {probe}"), "bare cat should return read_file output"
-    assert "already read" in tool_bash(f"cat {probe}"), "second cat should dedupe like read_file"
-    assert bare_cat_paths("cat a.txt | grep x") is None, "cat in a pipe stays raw bash"
-    assert bare_cat_paths("cat -n a.txt") is None, "cat with flags stays raw bash"
-    assert tool_bash("cat /no/such/file/xyz").startswith("exit"), "missing file falls through to bash"
-
-    # input editor: layout, key handling, escape parsing (no TTY needed)
-    rows, cr, cc = _layout("> abc", 5, 80)
-    assert rows == ["> abc"] and (cr, cc) == (0, 5), "layout basic"
-    rows, cr, cc = _layout("abc", 3, 2)
-    assert rows == ["ab", "c"] and (cr, cc) == (1, 1), "layout wrap"
-    assert _interpret_escape(None, ("meta-enter",)) == ("newline",), "alt+enter"
-    assert _interpret_escape(None, ("csi", "13;2u")) == ("newline",), "shift+enter"
-    assert _interpret_escape(None, ("csi", "13u")) == ("enter",), "kitty plain enter"
-    assert _interpret_escape(None, ("csi", "C")) == ("right",)
-    assert _interpret_escape(None, ("csi", "3~")) == ("delete",)
-    assert _interpret_escape(None, ("ss3", "A")) == ("up",)
-    rfd, wfd = os.pipe()
-    os.write(wfd, b"pasted\r\ntext\x1b[201~")
-    assert _interpret_escape(rfd, ("csi", "200~")) == ("paste", "pasted\ntext"), "bracketed paste"
-    os.close(rfd)
-    os.close(wfd)
-    h = {"items": ["one", "two"], "idx": 2, "stash": ""}
-    b, c, a = _apply_key("", 0, ("up",), h)
-    assert b == "two" and a == "continue", "history recall"
-    b, c, a = _apply_key(b, c, ("up",), h)
-    assert b == "one"
-    b, c, a = _apply_key(b, c, ("char", "X"), h)
-    assert (b, c) == ("oneX", 4), "insert char"
-    b, c, a = _apply_key(b, c, ("newline",), h)
-    assert (b, c) == ("oneX\n", 5), "insert newline"
-    b, c, a = _apply_key("hello", 5, ("backspace",), h)
-    assert (b, c) == ("hell", 4), "backspace"
-    assert _apply_key("hi", 2, ("enter",), h)[2] == "submit", "enter submits"
-    assert _apply_key("", 0, ("eof",), h)[2] == "eof", "ctrl-d on empty"
-    assert _apply_key("x", 1, ("eof",), h)[2] == "continue", "ctrl-d ignored with text"
-
-    assert est_tokens([{"role": "user", "content": "x" * 300}]) > 90, "token estimate"
-    LAST_USAGE = {"prompt_tokens": 12000, "completion_tokens": 345}
-    assert "12.3k" in format_meter([]), "meter should render measured tokens"
-    LAST_USAGE = None
-    assert format_meter([{"role": "user", "content": "x" * 300}]).startswith("ctx ~"), \
-        "meter should mark char estimate with ~"
-
-    # persistent prompt history: JSON-per-line round-trips multi-line entries
-    HISTFILE = os.path.join(tempfile.mkdtemp(), "hist")
-    save_history("first prompt")
-    save_history("two\nlines")
-    save_history("/skip me")  # slash commands aren't persisted
-    assert load_history() == ["first prompt", "two\nlines"], "history round-trip"
+    with patch.object(socket.socket, "connect", local_connect), contextlib.redirect_stdout(io.StringIO()):
+        _selftest()
     print("selftest OK")
 
 
+def _selftest():
+    global BASE_URL, WINDOW, MAX_TOKENS, REPLY_BYTES, COMPACT_TOKENS, MARGIN, MAX_TOOL_OUTPUT
+    global HISTFILE, HISTORY_ENABLED, PLAN, LAST_USAGE, TOKEN_SCALE, BASH_TIMEOUT, MAX_STEPS
+    import copy
+    import http.server
+    import io
+    from pathlib import Path
+    from unittest.mock import patch
+
+    WINDOW, MAX_TOKENS, REPLY_BYTES, COMPACT_TOKENS, MARGIN, MAX_TOOL_OUTPUT = 32768, 2048, 2048, 1024, 1024, 4096
+    PLAN, TOKEN_SCALE = False, 1.0
+
+    def frame(delta, finish=None):
+        return b"data: " + encoded({"choices": [{"delta": delta, "finish_reason": finish}]}) + b"\n\n"
+
+    def call(name, args, ident="test"):
+        return {"role": "assistant", "content": None, "tool_calls": [{"id": ident, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}
+
+    def streamed_call(name, args, ident="test", index=0):
+        return {"tool_calls": [{"index": index, "id": ident, "type": "function", "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}}]}
+
+    done = {"role": "assistant", "content": "done"}
+    with tempfile.TemporaryDirectory(prefix="familiar-test-", dir=os.getcwd()) as directory:
+        root = Path(directory)
+        probe = str(root / "prøbe.txt")
+
+        class Mock(http.server.BaseHTTPRequestHandler):
+            replies = []
+            requests = []
+            props = {"default_generation_settings": {"n_ctx": 32768}}
+
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                type(self).requests.append(payload)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                reply = type(self).replies.pop(0)
+                self.wfile.write(reply)
+
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(encoded(type(self).props))
+
+            def log_message(self, *args):
+                pass
+
+        class MinimalMock(Mock):
+            props = {}
+            replies = []
+            requests = []
+
+        servers = [http.server.ThreadingHTTPServer(("127.0.0.1", 0), cls) for cls in (Mock, MinimalMock)]
+        workers = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+        for worker in workers:
+            worker.start()
+        try:
+            BASE_URL = f"http://127.0.0.1:{servers[0].server_port}/v1"
+            with patch.dict(os.environ, {}, clear=True):
+                assert resolve_ctx_budget() == (32768, 32768)
+                os.environ["FAMILIAR_CTX_TOKENS"] = "65536"
+                assert resolve_ctx_budget() == (32768, 32768)
+                os.environ["FAMILIAR_CTX_TOKENS"] = "8192"
+                assert resolve_ctx_budget() == (8192, 32768)
+                os.environ["FAMILIAR_CTX_TOKENS"] = "bad"
+                try:
+                    resolve_ctx_budget()
+                    assert False, "invalid context accepted"
+                except ValueError:
+                    pass
+            Mock.replies = [frame(streamed_call("write_file", {"path": probe, "content": "hello"})) + b"data: [DONE]\n\n", frame({"content": "done"}, "stop"), frame({"content": "No relevant check applies to this text file."}, "stop")]
+            transcript = new_conversation()
+            agent_turn(transcript, "create the probe")
+            assert Path(probe).read_bytes() == b"hello"
+            assert_pairs(transcript)
+            assert any(m.get("_generated") for m in transcript)
+            assert not any("_generated" in m for r in Mock.requests for m in r["messages"])
+            assert all(r["max_tokens"] == MAX_TOKENS for r in Mock.requests)
+
+            BASE_URL = f"http://127.0.0.1:{servers[1].server_port}/v1"
+            with patch.dict(os.environ, {}, clear=True):
+                try:
+                    resolve_ctx_budget()
+                    assert False, "unknown context defaulted silently"
+                except ValueError:
+                    pass
+                os.environ["FAMILIAR_CTX_TOKENS"] = "16384"
+                assert resolve_ctx_budget() == (16384, None)
+            MinimalMock.replies = [frame({"content": "minimal server"}) + b"data: [DONE]\n\n"]
+            assert chat([{"role": "user", "content": "hello"}])["content"] == "minimal server"
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            for worker in workers:
+                worker.join(timeout=2)
+
+        for bad_url in ("http://example.com/v1", "file:///tmp/server", "http://127.0.0.1:0/v1", "http://user@127.0.0.1/v1", "http://127.0.0.1/v1?key=x", "http://127.0.0.1:99999/v1"):
+            try:
+                local_url(bad_url)
+                assert False, bad_url
+            except ValueError:
+                pass
+        assert local_url("http://[::1]:8321/v1/") == "http://[::1]:8321/v1"
+        try:
+            LocalRedirect().redirect_request(urllib.request.Request(BASE_URL), None, 302, "", {}, "http://example.com/")
+            assert False, "remote redirect accepted"
+        except ValueError:
+            pass
+        assert not any(isinstance(handler, urllib.request.ProxyHandler) and handler.proxies for handler in HTTP.handlers)
+
+        base = [{"role": "system", "content": "test"}, {"role": "user", "content": "write"}]
+        full = streamed_call("write_file", {"path": probe, "content": "must not write"})
+        failures = [frame(full), frame(full) + b"data: {bad json}\n\n", frame(full) + b'data: {"error":"failed"}\n\n', frame(streamed_call("write_file", "[]"), "stop"), frame(streamed_call("", {}), "stop"), frame({"tool_calls": full["tool_calls"] + streamed_call("read_file", {"path": probe}, index=1)["tool_calls"]}, "stop"), frame({"tool_calls": [dict(full["tool_calls"][0], index=-1)]}, "stop"), frame({"content": "x" * (REPLY_BYTES + 1)}, "stop"), frame({**full, "content": 0}, "stop")]
+        for raw in failures:
+            before = Path(probe).read_bytes()
+            response = io.BytesIO(raw)
+            with patch.object(HTTP, "open", return_value=response):
+                try:
+                    agent_turn(new_conversation(), "write something")
+                    assert False, "failed stream accepted"
+                except ProtocolError:
+                    pass
+            assert Path(probe).read_bytes() == before
+            assert response.closed
+        usage = {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 7}}
+        with patch.object(HTTP, "open", return_value=io.BytesIO(b": ping\n\n" + frame({"content": "ok"}, "stop") + b"data: " + encoded(usage) + b"\n\ndata: [DONE]\n\n")):
+            assert chat(base)["content"] == "ok"
+        assert LAST_USAGE["usage"]["prompt_tokens"] == 120
+        assert "estimated" in format_meter(base)
+        partial = streamed_call("write_file", '{"path":"a.txt","content":"hel')
+        with patch.object(HTTP, "open", side_effect=[io.BytesIO(frame(partial, "length")), io.BytesIO(frame({"content": 'lo"}'}, "stop"))]) as opener:
+            result = chat(base)
+            assert json.loads(result["tool_calls"][0]["function"]["arguments"])["content"] == "hello"
+            assert json.loads(opener.call_args[0][0].data)["tools"] == []
+        for raw in (frame({"content": "x"}, "length"), frame({"content": "bad JSON"}, "stop")):
+            with patch.object(HTTP, "open", side_effect=[io.BytesIO(frame(partial, "length")), io.BytesIO(raw), io.BytesIO(raw)]) as opener:
+                try:
+                    assert not chat(base).get("tool_calls")
+                except ProtocolError:
+                    pass
+                assert opener.call_count <= 3
+        capped_multi = {"tool_calls": full["tool_calls"] + streamed_call("read_file", {"path": probe}, "two", 1)["tool_calls"]}
+        with patch.object(HTTP, "open", return_value=io.BytesIO(frame(capped_multi, "length"))) as opener:
+            assert not chat(base).get("tool_calls") and opener.call_count == 1
+
+        for variant in (b"alpha\nbeta\n", b"alpha\nbeta", b"alpha\r\nbeta\r\n", b"\xef\xbb\xbfalpha\r\nbeta", "α alpha\nβ beta".encode()):
+            _FILE_VERSIONS.clear()
+            Path(probe).write_bytes(variant)
+            tool_read_file(probe)
+            assert not run_tool("edit_file", {"path": probe, "old": "beta", "new": "BETA"}).startswith("ERROR")
+            assert Path(probe).read_bytes() == variant.replace(b"beta", b"BETA")
+        _FILE_VERSIONS.clear()
+        Path(probe).write_bytes(b"one\ntwo\nthree")
+        for start, end in ((0, 1), (2, 1), (1, 4), (4, 4)):
+            assert run_tool("edit_file", {"path": probe, "start_line": start, "end_line": end, "new": "bad"}).startswith("ERROR")
+            assert Path(probe).read_bytes() == b"one\ntwo\nthree"
+        assert not run_tool("edit_file", {"path": probe, "start_line": 3, "end_line": 3, "new": "THREE"}).startswith("ERROR")
+        assert Path(probe).read_bytes() == b"one\ntwo\nTHREE"
+        assert run_tool("edit_file", {"path": probe, "old": "one", "start_line": 1, "end_line": 1, "new": "x"}).startswith("ERROR")
+        assert run_tool("edit_file", {"path": probe, "old": "", "new": "x"}).startswith("ERROR")
+        assert run_tool("multi_edit", {"path": probe, "edits": []}).startswith("ERROR")
+        assert run_tool("read_file", {"path": probe, "offset": True}).startswith("ERROR")
+        assert run_tool("multi_edit", {"path": probe, "edits": [{"old": "one", "new": "ONE"}, {"old": "missing", "new": "X"}]}).startswith("ERROR")
+        assert Path(probe).read_bytes() == b"one\ntwo\nTHREE"
+        assert not run_tool("multi_edit", {"path": probe, "edits": [{"old": "one", "new": "ONE"}, {"old": "ONE", "new": "1"}]}).startswith("ERROR")
+        assert Path(probe).read_bytes() == b"1\ntwo\nTHREE"
+        before = Path(probe).read_bytes()
+        for operation in ("replace", "fsync"):
+            with patch.object(os, operation, side_effect=PermissionError("injected before commit")):
+                assert run_tool("edit_file", {"path": probe, "old": "two", "new": "TWO"}).startswith("ERROR")
+            assert Path(probe).read_bytes() == before
+            assert not list(root.glob(".familiar-*"))
+        tool_read_file(probe)
+        Path(probe).write_bytes(before.replace(b"two", b"TWO"))
+        assert "changed since" in run_tool("edit_file", {"path": probe, "old": "THREE", "new": "three"})
+        tool_read_file(probe)
+        assert not run_tool("edit_file", {"path": probe, "old": "THREE", "new": "three"}).startswith("ERROR")
+        Path(probe).chmod(0o444)
+        assert run_tool("write_file", {"path": probe, "content": "x"}).startswith("ERROR")
+        Path(probe).chmod(0o644)
+        if os.name != "nt":
+            link = root / "link"
+            link.symlink_to(probe)
+            assert "non-symlink" in run_tool("write_file", {"path": str(link), "content": "x"})
+            fifo = root / "fifo"
+            os.mkfifo(fifo)
+            assert "regular" in run_tool("read_file", {"path": str(fifo)})
+            fifo.unlink()
+        pyprobe = str(root / "test.py")
+        run_tool("write_file", {"path": pyprobe, "content": "x = 1\n"})
+        for name, args in (("edit_file", {"old": "1", "new": "("}), ("edit_file", {"start_line": 1, "end_line": 1, "new": "x = ("}), ("multi_edit", {"edits": [{"old": "1", "new": "("}]}), ("write_file", {"content": "x = ("})):
+            assert "invalid Python" in run_tool(name, {"path": pyprobe, **args})
+            assert Path(pyprobe).read_bytes() == b"x = 1\n"
+
+        _READ_SEEN.clear()
+        _FILE_VERSIONS.clear()
+        Path(probe).write_bytes(b"a\na\nb\n")
+        assert "offset=3" in tool_read_file(probe, limit=2)
+        assert "already read" in tool_read_file(probe, limit=2)
+        old_stat = os.stat(probe)
+        Path(probe).write_bytes(b"a\na\nc\n")
+        os.utime(probe, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+        assert "already read" not in tool_read_file(probe, limit=2)
+        long = root / "long.txt"
+        long.write_bytes(b"a" * 100000 + b"needle\nlast\n")
+        page = tool_read_file(str(long))
+        assert "column=" in page and len(encoded(page)) <= MAX_TOOL_OUTPUT
+        next_column = int(re.search(r"column=(\d+)", page)[1])
+        assert f"byte {next_column}" in tool_read_file(str(long), column=next_column)
+        binary = root / "binary"
+        binary.write_bytes(b"a\0b")
+        assert "binary" in tool_read_file(str(binary))
+        assert "is a directory" in tool_read_file(directory)
+        assert "long.txt:1:" in tool_search(str(long), "needle")
+        assert "skipped" in tool_search(directory, "needle")
+        assert "limit" in tool_search(probe, "a", limit=1)
+        _READ_SEEN.clear()
+        quote = subprocess.list2cmdline([probe]) if os.name == "nt" else shlex.quote(probe)
+        assert "1\ta" in tool_bash("cat " + quote)
+        assert "already read" in tool_bash("cat " + quote)
+        assert bare_cat_paths("cat a | grep x") is None
+        assert bare_cat_paths("cat -n a") is None
+        assert bare_cat_paths("cat *.txt") is None
+
+        for command in ("git commit -m hi", "git -C /tmp push", "git checkout main", "git branch -D old", "echo ok && git merge feature"):
+            assert "blocked" in tool_bash(command)
+        assert tool_bash("exit 3").startswith("exit 3")
+        assert tool_bash("echo ok").startswith("exit 0")
+
+        def python_command(code):
+            return subprocess.list2cmdline([sys.executable, "-c", code]) if os.name == "nt" else shlex.join([sys.executable, "-c", code])
+
+        spaced = root / "space name 雪.txt"
+        spaced.write_bytes(b"path works")
+        assert "path works" in tool_bash(python_command("from pathlib import Path; print(Path(" + repr(str(spaced)) + ").read_text())"))
+        large = tool_bash(python_command("import sys; print('HEAD'); sys.stdout.write('x'*200000); sys.stderr.write('TAIL failure')"))
+        assert "HEAD" in large and "TAIL failure" in large and "bytes omitted" in large
+        assert len(large.encode()) < MAX_TOOL_OUTPUT
+        saved_timeout, BASH_TIMEOUT = BASH_TIMEOUT, 1
+        started = time.monotonic()
+        timeout = tool_bash(python_command("import time; time.sleep(20)"))
+        assert "timed out" in timeout and time.monotonic() - started < 8
+        real_wait, interrupted = subprocess.Popen.wait, []
+
+        def interrupt_once(process, *args, **kwargs):
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return real_wait(process, *args, **kwargs)
+
+        with patch.object(subprocess.Popen, "wait", interrupt_once):
+            canceled = tool_bash(python_command("import time; time.sleep(20)"))
+        assert canceled.startswith("CANCELED")
+        interrupted.clear()
+        with patch.object(subprocess.Popen, "wait", interrupt_once), patch.object(os, "kill" if os.name == "nt" else "killpg", side_effect=PermissionError("injected cleanup failure")), patch.object(subprocess.Popen, "kill", side_effect=PermissionError("injected parent kill failure")), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            canceled = tool_bash(python_command("import time; time.sleep(0.5)"))
+        assert canceled.startswith("CANCELED") and "uncertain" in canceled
+        BASH_TIMEOUT = saved_timeout
+        child_script = root / "spawn.py"
+        child_script.write_text("import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n", encoding="utf-8")
+        started = time.monotonic()
+        orphan = tool_bash(python_command("exec(open(" + repr(str(child_script)) + ").read())"))
+        assert time.monotonic() - started < 8
+        assert "cleanup" in orphan or "process group" in orphan or "tree termination" in orphan
+
+        for script in ([call("read_file", {"path": "A"}), call("read_file", {"path": "B"}), call("read_file", {"path": "A"}), done], [call("read_file", {"path": "A", "offset": 1}), call("read_file", {"offset": 1, "path": "A"}), done]):
+            transcript = new_conversation()
+            with patch.dict(globals(), chat=lambda m, it=iter(script): next(it)):
+                agent_turn(transcript, "read")
+            assert any("skipped: identical" in m.get("content", "") for m in transcript if m["role"] == "tool")
+        writes = [call("write_file", {"path": probe, "content": "same"}), call("write_file", {"path": probe + "2", "content": "same"}), call("write_file", {"path": probe, "content": "same"}), call("bash", {"command": "exit 1"}), done]
+        transcript = new_conversation()
+        with patch.dict(globals(), chat=lambda m, it=iter(writes): next(it)):
+            agent_turn(transcript, "write")
+        assert any("skipped: identical" in m.get("content", "") for m in transcript if m["role"] == "tool")
+        assert STATE["pending_check"]
+
+        group = call("write_file", {"path": probe, "content": "committed"}, "first")
+        group["tool_calls"].append(call("bash", {"command": "exit 0"}, "second")["tool_calls"][0])
+        group["tool_calls"].append(call("write_file", {"path": probe + "never", "content": "never"}, "third")["tool_calls"][0])
+        transcript = new_conversation()
+        real_run = run_tool
+
+        def interrupted_run(name, args, budget=None):
+            if name == "bash":
+                raise KeyboardInterrupt
+            return real_run(name, args, budget)
+
+        with patch.dict(globals(), chat=lambda m: group, run_tool=interrupted_run):
+            agent_turn(transcript, "do three things")
+        assert_pairs(transcript)
+        assert Path(probe).read_bytes() == b"committed" and not Path(probe + "never").exists()
+        assert "uncertain" in transcript[-2]["content"] and "NOT RUN" in transcript[-1]["content"]
+        transcript = new_conversation()
+        with patch.dict(globals(), chat=lambda m: group, run_tool=lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt())):
+            agent_turn(transcript, "cancel first")
+        assert_pairs(transcript)
+        assert all("NOT RUN" in m["content"] for m in transcript[-2:])
+        transcript = new_conversation()
+        with patch.dict(globals(), MAX_STEPS=1, chat=lambda m: call("read_file", {"path": probe})):
+            agent_turn(transcript, "step bound")
+        assert_pairs(transcript)
+        assert "stopped at 1" in transcript[-1]["content"] and not transcript[-1].get("tool_calls")
+
+        PLAN = True
+        assert {t["function"]["name"] for t in active_tools()} == READ_ONLY
+        for name, args in (("bash", {"command": "echo forbidden"}), ("write_file", {"path": probe, "content": "forbidden"}), ("edit_file", {"path": probe, "old": "committed", "new": "forbidden"}), ("multi_edit", {"path": probe, "edits": [{"old": "committed", "new": "forbidden"}]})):
+            assert "read-only" in run_tool(name, args)
+        assert "Plan mode" in new_conversation()[0]["content"] and PLAN
+        PLAN = False
+        assert "Plan mode" not in new_conversation()[0]["content"]
+
+        transcript = new_conversation()
+        before = copy.deepcopy(transcript)
+        agent_turn(transcript, "later correction " * WINDOW)
+        assert transcript == before and STATE["draft"].startswith("later correction")
+        assert STATE["pause"]
+        assert estimate([{"role": "user", "content": "雪" * 100}], []) > estimate([{"role": "user", "content": "a" * 100}], [])
+        assert estimate(base, active_tools()) > estimate(base, [])
+        transcript = new_conversation()
+        transcript.extend([{"role": "user", "content": "original task"}, {"role": "assistant", "content": "observed " * 1500}, {"role": "user", "content": "later correction, verbatim\n snow 雪"}, {"role": "assistant", "content": "older findings " * 300}])
+        last_group = call("read_file", {"path": probe}, "last")
+        transcript.extend([last_group, receipt(last_group["tool_calls"][0], "latest source\n")])
+        STATE["pending_check"], STATE["nudged"] = True, True
+        users = [m["content"] for m in transcript if m["role"] == "user"]
+        snapshot = copy.deepcopy(transcript)
+        read_snapshot = copy.deepcopy(_READ_SEEN)
+        for result in (({"role": "assistant", "content": ""}, "complete"), ({"role": "assistant", "content": "short"}, "capped"), (call("read_file", {"path": probe}), "complete")):
+            with patch.dict(globals(), stream_completion=lambda *a, r=result, **kw: r):
+                assert not compact(transcript)
+            assert transcript == snapshot and _READ_SEEN == read_snapshot
+        with patch.dict(globals(), stream_completion=lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt())):
+            assert not compact(transcript)
+        assert transcript == snapshot
+        with patch.dict(globals(), stream_completion=lambda *a, **kw: ({"role": "assistant", "content": "Observed changes; no check passed. Later correction supersedes the task."}, "complete")):
+            assert compact(transcript)
+        assert [m["content"] for m in transcript if m["role"] == "user"] == users
+        assert transcript[-2:] == snapshot[-2:] and not _READ_SEEN
+        assert STATE["pending_check"] and STATE["nudged"] and LAST_USAGE is None
+        assert_pairs(transcript)
+        assert "already read" not in tool_read_file(probe)
+        assert not compact(new_conversation())
+
+        def fail_before_dispatch(calls):
+            raise KeyboardInterrupt
+
+        transcript = new_conversation()
+        with patch.dict(globals(), chat=lambda m: group, validate_calls=fail_before_dispatch):
+            agent_turn(transcript, "interrupt before dispatch")
+        assert_pairs(transcript)
+        assert all(m["content"].startswith("NOT RUN") for m in transcript[-3:])
+        transcript = new_conversation()
+        one_write = call("write_file", {"path": probe, "content": "once"})
+
+        def interrupt_after_write(messages):
+            if any(m["role"] == "tool" for m in messages):
+                raise KeyboardInterrupt
+            return one_write
+
+        with patch.dict(globals(), chat=interrupt_after_write):
+            try:
+                agent_turn(transcript, "write once")
+            except KeyboardInterrupt:
+                pass
+        assert_pairs(transcript)
+        assert Path(probe).read_bytes() == b"once"
+
+        real_admission = admission
+
+        def pause_second(messages, *args, **kwargs):
+            if any(m.get("tool_call_id") == "second" and (m.get("content") or "").startswith("xxxx") for m in messages):
+                raise ContextPause("injected result saturation")
+            return real_admission(messages, *args, **kwargs)
+
+        transcript = new_conversation()
+        with patch.dict(globals(), chat=lambda m: group, admission=pause_second):
+            agent_turn(transcript, "one write then context saturation")
+        assert_pairs(transcript)
+        assert Path(probe).read_bytes() == b"committed" and not Path(probe + "never").exists()
+        assert all(m["content"].startswith("NOT RUN") for m in transcript[-2:])
+        assert STATE["pending_check"]
+
+        def block_nudge(messages, *args, **kwargs):
+            if messages[-1].get("_generated"):
+                raise ContextPause("injected nudge saturation")
+            return real_admission(messages, *args, **kwargs)
+
+        transcript = new_conversation()
+        with patch.dict(globals(), chat=lambda m, it=iter([one_write, done]): next(it), admission=block_nudge):
+            agent_turn(transcript, "write, then pause before verification nudge")
+        assert STATE["pending_check"] and not STATE["nudged"]
+        assert not any(m.get("_generated") for m in transcript)
+
+        transcript = new_conversation()
+        transcript.append({"role": "user", "content": "One task followed by many observations; preserve this exactly."})
+        for i in range(8):
+            observation = call("read_file", {"path": probe}, f"obs_{i}")
+            transcript.extend([observation, receipt(observation["tool_calls"][0], "older source observation " * 80)])
+        PLAN = True
+        transcript[0] = system_message()
+        latest = copy.deepcopy(transcript[-2:])
+        compact_request = []
+
+        def summary_request(messages, tools=None, purpose="normal"):
+            compact_request.append(copy.deepcopy(messages))
+            data, _, _ = build_request(messages, tools, purpose)
+            assert json.loads(data)["tools"] == []
+            return {"role": "assistant", "content": "Earlier reads found source text. No edit or check was performed."}, "complete"
+
+        with patch.dict(globals(), stream_completion=summary_request):
+            assert compact(transcript)
+        assert PLAN and transcript[0] == system_message() and transcript[-2:] == latest
+        assert sum(m["role"] == "user" and not m.get("_generated") for m in compact_request[0]) == 1
+        assert_pairs(transcript)
+        transcript.insert(2, {"role": "assistant", "content": "additional old observation " * 300})
+        with patch.dict(globals(), stream_completion=summary_request):
+            assert compact(transcript)
+        assert sum(m["role"] == "user" and not m.get("_generated") for m in transcript) == 1
+        PLAN = False
+        new_conversation()
+
+        failed_state = [system_message(), {"role": "user", "content": "x" * WINDOW}, {"role": "assistant", "content": "old observation " * 2000}, done]
+        old = copy.deepcopy(failed_state)
+        with patch.object(HTTP, "open", side_effect=AssertionError("must refuse before HTTP")):
+            assert not compact(failed_state)
+        assert failed_state == old
+
+        for invalid in (b"\xffbad", b"a\r\nb\nc"):
+            _FILE_VERSIONS.clear()
+            Path(probe).write_bytes(invalid)
+            assert run_tool("edit_file", {"path": probe, "old": "a", "new": "A"}).startswith("ERROR")
+            assert Path(probe).read_bytes() == invalid
+        _FILE_VERSIONS.clear()
+        Path(probe).write_bytes(b"original\n")
+        real_fsync = os.fsync
+
+        def change_before_commit(fd):
+            Path(probe).write_bytes(b"external\n")
+            return real_fsync(fd)
+
+        with patch.object(os, "fsync", change_before_commit):
+            assert "changed before" in run_tool("edit_file", {"path": probe, "old": "original", "new": "updated"})
+        assert Path(probe).read_bytes() == b"external\n"
+        fresh = str(root / "appeared.txt")
+        real_link = os.link
+
+        def appeared(source, destination):
+            Path(destination).write_bytes(b"appeared meanwhile")
+            return real_link(source, destination)
+
+        with patch.object(os, "link", appeared):
+            assert run_tool("write_file", {"path": fresh, "content": "must not overwrite"}).startswith("ERROR")
+        assert Path(fresh).read_bytes() == b"appeared meanwhile"
+        if os.name != "nt":
+            Path(probe).chmod(0o755)
+            assert not run_tool("edit_file", {"path": probe, "old": "external", "new": "updated"}).startswith("ERROR")
+            assert stat.S_IMODE(os.stat(probe).st_mode) == 0o755
+
+        previous_directory = os.getcwd()
+        try:
+            os.chdir(root)
+            Path("FAMILIAR.md").write_bytes(b"x" * 8193)
+            try:
+                build_system_prompt()
+                assert False, "oversized project notes accepted"
+            except ValueError:
+                pass
+        finally:
+            os.chdir(previous_directory)
+        with patch.dict(globals()), patch.dict(os.environ, {}, clear=True), patch.object(HTTP, "open", return_value=io.BytesIO(b'{"n_ctx":8192}')):
+            configure()
+            assert WINDOW == 8192 and MAX_TOKENS == 1024 and COMPACT_TOKENS == 512
+            assert admission([system_message()]) < 8192
+        with patch.dict(globals(), TOKEN_FIELD="max_completion_tokens", STREAM_USAGE=False):
+            data, _, _ = build_request(base)
+            assert "max_completion_tokens" in json.loads(data) and "stream_options" not in json.loads(data)
+        last_scale = TOKEN_SCALE
+        measured = estimate(base, active_tools()) * 2
+        raw = frame({"content": "calibrate"}, "stop") + b"data: " + encoded({"usage": {"prompt_tokens": measured}, "choices": []}) + b"\n\n"
+        with patch.object(HTTP, "open", return_value=io.BytesIO(raw)):
+            chat(base)
+        assert TOKEN_SCALE > last_scale
+        TOKEN_SCALE = last_scale
+
+        with patch.dict(globals(), HISTORY_ENABLED=False), patch.dict(globals(), read_input=lambda *a, it=iter(["first", "unsent", "/tokens", "/quit"]): next(it)), patch.object(HTTP, "open", side_effect=urllib.error.HTTPError(BASE_URL, 400, "context", {}, io.BytesIO(b"context window length exceeded"))) as opener:
+            repl()
+            assert opener.call_count == 1
+
+        HISTFILE = str(root / "history")
+        HISTORY_ENABLED = False
+        save_history("private")
+        assert load_history() == [] and not Path(HISTFILE).exists()
+        HISTORY_ENABLED = True
+        save_history("first")
+        save_history("two\nlines")
+        save_history("/compact")
+        assert load_history() == ["first", "two\nlines"]
+        HISTORY_ENABLED = False
+        before = Path(HISTFILE).read_bytes()
+        save_history("not saved")
+        assert load_history() == [] and Path(HISTFILE).read_bytes() == before
+        HISTFILE = directory
+        HISTORY_ENABLED = True
+        assert load_history() == []
+        save_history("unwritable")
+        with patch.object(sys, "stdin", io.StringIO("hello\n")), patch.object(sys, "stdout", io.StringIO()) as output:
+            assert read_input("prompt> ", []) == "hello"
+            assert output.getvalue() == "prompt> "
+            try:
+                read_input("prompt> ", [])
+                assert False
+            except EOFError:
+                pass
+        assert _layout("abc", 3, 2) == (["ab", "c"], 1, 1)
+        assert _interpret_escape(None, ("meta-enter",)) == ("newline",)
+        assert _interpret_escape(None, ("csi", "13;2u")) == ("newline",)
+        assert _interpret_escape(None, ("csi", "13u")) == ("enter",)
+        assert _interpret_escape(None, ("csi", "3~")) == ("delete",)
+        rfd, wfd = os.pipe()
+        try:
+            os.write(wfd, b"pasted\r\ntext\x1b[201~")
+            assert _interpret_escape(rfd, ("csi", "200~")) == ("paste", "pasted\ntext")
+        finally:
+            os.close(rfd)
+            os.close(wfd)
+        history = {"items": ["one", "two"], "idx": 2, "stash": ""}
+        assert _apply_key("", 0, ("up",), history)[0] == "two"
+        assert _apply_key("abc", 3, ("newline",), history)[:2] == ("abc\n", 4)
+        assert _apply_key("abc", 3, ("backspace",), history)[:2] == ("ab", 2)
+        assert _apply_key("", 0, ("eof",), history)[2] == "eof"
+        if _RAW_OK:
+            with patch.dict(os.environ, {"TERM": "xterm"}), patch.object(sys.stdin, "isatty", return_value=True), patch.object(sys.stdout, "isatty", return_value=True), patch.object(sys.stdin, "fileno", return_value=0), patch.object(termios, "tcgetattr", return_value=["saved"]), patch.object(termios, "tcsetattr") as restore, patch.object(tty, "setraw"), patch.dict(globals(), _edit=lambda *a: (_ for _ in ()).throw(KeyboardInterrupt())):
+                try:
+                    read_input("x", [])
+                except KeyboardInterrupt:
+                    pass
+                assert restore.call_args[0][2] == ["saved"]
+
+
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     argv = sys.argv if argv is None else argv
     if "--version" in argv:
         print(f"familiar {__version__}")
         return
-    init_workspace(argv)
-    if "--selftest" in argv:
-        selftest()
-    else:
+    try:
+        if "--selftest" in argv:
+            selftest()
+            return
+        configure()
+        init_workspace(argv)
+        admission([system_message()])
         repl()
+    except (ValueError, OSError, ContextPause) as error:
+        print(f"Familiar: {error}", file=sys.stderr)
+        if isinstance(error, ContextPause):
+            print("Increase the actual server window/working ceiling, lower FAMILIAR_MAX_TOKENS, or shorten FAMILIAR.md.", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

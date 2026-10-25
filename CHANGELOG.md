@@ -1,14 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
-- Preserve the head and tail of long tool output; reject invalid Python writes.
-- Detect alternating and canonical-equivalent tool loops. Continue capped replies
-  within three requests and discard incomplete tool arguments.
-
-- Make the read-only Git selftests accept commit messages containing "blocked".
-  They now check that the command reached the shell, so repository history cannot
-  produce a false guard failure. Runtime command policy is unchanged.
+- Add manual in-memory compaction and pause before context loss.
+- Enforce Plan read/search-only dispatch and loopback-only model transport.
+- Validate complete streams, settle interrupted tool groups, preserve atomic edits,
+  and bound file/search/shell output.
+- Support Windows, Linux and macOS in the single-file core, with optional input
+  history and the existing macOS launcher.
 
 ## 0.1.0
 

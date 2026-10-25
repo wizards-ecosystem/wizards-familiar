@@ -1,79 +1,38 @@
 # Security
 
-This file overrides the [organization default](https://github.com/wizards-ecosystem/.github/blob/main/SECURITY.md)
-for The Wizard's Familiar.
+The Wizard's Familiar runs model-chosen commands as you. Normal has no sandbox or
+approval prompt: commands can read/write your files and reach the network. Repository
+content can influence the model. Use trusted code and a reviewable git working tree.
 
-## The trust model, stated plainly
+Plan exposes and dispatches only native read/list/search, rejecting shell and mutation
+calls even when fabricated. This is a tool boundary, not OS isolation against hostile
+filesystems. Normal's textual git allowlist prevents common accidental commits/pushes;
+quoting or indirection can bypass it. It is not an adversarial boundary.
 
-Familiar is an agent that runs shell commands chosen by a language model, on your
-machine, as you, with no sandbox. That is what it is for. It is not a hardened
-boundary and it is not trying to be one.
+Model HTTP accepts loopback endpoints only, disables inherited proxies and rejects
+remote redirects. Familiar makes no telemetry, cloud inference or model-download
+calls. The local server can still log or proxy data; Normal shell networking remains
+unrestricted. Compatible servers must honor bounded generation and terminal markers.
+Incomplete streams authorize no tools; interrupted groups retain accurate receipts.
 
-Concretely:
+Source reads and search are bounded and report truncation. Edits require regular,
+writable UTF-8 files up to 8 MiB, preserve BOM/newlines, reject mixed endings/symlinks,
+and compare content fingerprints before replacement. Same-directory atomic publication
+protects original bytes against pre-commit failure. It does not promise power-loss
+durability, every ACL/xattr, adversarial race protection or containment of detached
+command descendants. New-file publication requires filesystem hard-link support.
 
-- `bash` runs whatever the model asks for, with your user's full permissions. It can
-  read any file you can read, write any file you can write, and reach the network.
-- The model's input includes the contents of files it reads. A repository you did not
-  write can therefore influence what the agent tries to do next. Treat running
-  Familiar on untrusted code the same way you would treat running that code.
-- There is no approval prompt before a command runs. Commands are printed as they
-  execute, not before.
+Conversation and compaction state stay in memory. User-input history is separate and
+enabled by default; it can contain private text. `FAMILIAR_HISTORY=0` disables history
+reads/writes. `/new` and exit release references, without secure RAM-erasure guarantees
+or control over swap, crash dumps, terminal scrollback or server logging.
 
-Two limits do hold, and they are tested:
+Report violations of these documented contracts through this repository's private
+vulnerability reporting (Security, Report a vulnerability). Include the version,
+Python/server/model details and a minimal reproduction without credentials. Intended
+unsandboxed command behavior is outside that contract. This policy overrides the
+organization default.
 
-| Limit | Where |
-| --- | --- |
-| git is restricted to a read-only allowlist, so the agent cannot commit, push, checkout, merge, or delete a branch | `GIT_RO` and `git_guard()` in `familiar.py` |
-| `/plan` mode removes the write, edit and multi-edit tools from the tool list and also refuses them at execution | `active_tools()` and `run_tool()` |
-
-Both are covered by `./familiar.py --selftest`. The git guard handles `-C`, chained
-commands, and the mutating forms of `git branch`.
-
-Neither limit constrains `bash`, and the git guard is a guardrail rather than a
-boundary. It matches `git <subcommand>` textually, so quoting or indirection slips
-past it. Both of these are allowed through today, verified against `git_guard()`:
-
-```sh
-git 'commit' -m x      # quoted subcommand does not match
-g=git; $g commit -m x  # the name is not literally "git" at match time
-```
-
-Chained commands, `-C`, `xargs git ...`, `sh -c '...'`, and an absolute path to the
-binary are all caught. The guard exists to stop a weak model from casually running
-`git commit`, which is the failure it was written for. It is not a defense against a
-model or a repository trying to get around it, and nothing stops `rm` regardless. If
-you need a real boundary, run Familiar in a container or a VM.
-
-## Reduce the blast radius
-
-- Run it against a git working tree with your work committed, so any edit is reviewable
-  with `git diff` and reversible.
-- Prefer `/plan` when pointing it at code you do not know.
-- Do not run it as root.
-
-## What is in scope for a report
-
-A defect where Familiar does something the documented model says it cannot: the git
-guard letting a mutating git command through, plan mode applying an edit, the re-read
-guard or the trim logic corrupting a file, or a crash that leaves a partially written
-file behind. `tool_multi_edit` is meant to be atomic; a partial write from it is a bug.
-
-Out of scope: the fact that `bash` is unsandboxed, and anything downstream of that. It
-is the documented design.
-
-## Reporting
-
-Use GitHub's private vulnerability reporting on this repository (Security, then Report
-a vulnerability). Do not open a public issue.
-
-Include the commit, your Python version, the model and `llama-server` build, and the
-smallest reproduction you can get to. Remove credentials and private source first.
-
-This project has no supported-version policy, disclosure timeline, or response-time
-commitment. A report will be read and handled.
-
-## The model is not ours
-
-Familiar launches Ornith-1.0-35B from Hugging Face. That model's weights, licence, and
-behavior are the upstream publisher's, not this project's. Familiar does not verify the
-download beyond what `curl` reports.
+The optional macOS launcher runs a separately provisioned Ornith-1.0-35B model. Its
+weights, license and behavior belong to the upstream publisher. Familiar does not
+verify model downloads.

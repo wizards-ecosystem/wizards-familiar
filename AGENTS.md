@@ -12,7 +12,7 @@ constraints below are the product, not incidental.
 | Zero runtime dependencies | A tool that edits your files should not arrive with a dependency tree to audit. CI enforces it |
 | One file | It stays small enough to read end to end. Do not split `familiar.py` into a package |
 | No cloud, no API key | Everything runs on the machine in front of you |
-| macOS on Apple Silicon | The only platform that is tested and supported. `serve.sh` uses BSD `sysctl` and `stat` |
+| Windows, Linux and macOS core | Run Python with an already-running local server. `serve.sh` is optional and remains macOS on Apple Silicon only |
 
 A change that trades one of these away for a feature is the wrong trade. Say so in the
 pull request if you think an exception is warranted.
@@ -32,19 +32,20 @@ pull request if you think an exception is warranted.
 ## Checks
 
 ```sh
-./familiar.py --selftest
+python familiar.py --selftest
 ./test_serve.sh
 ```
 
-Both must pass. The selftest stands up two mock servers and drives the real agent loop,
+The Python check must pass on all three platforms; the launcher check runs on macOS.
+The selftest stands up two mock servers and drives the real agent loop,
 so it is a genuine test rather than a smoke check. A behavior change without a matching
 case in `selftest()` is incomplete.
 
 ## Working on the loop-breakers
 
 Several pieces exist because a 35B local model is weaker than a hosted one and gets
-stuck: the re-read guard (`_READ_SEEN`), the duplicate-call window (`recent_keys`
-in `agent_turn`), the verify-after-edit nudge, bare `cat` routed through `read_file`,
+stuck: the re-read guard (`_READ_SEEN`), the four-call duplicate window,
+the verify-after-edit nudge, bare `cat` routed through `read_file`,
 and directory reads listed rather than errored. They look like workarounds because they
 are. Each has a selftest case pinning the behavior it was written for. Do not remove one
 without reading that case first.

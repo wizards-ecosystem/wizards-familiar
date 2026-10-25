@@ -1,6 +1,7 @@
 # The Wizard's Familiar
 
-> A stdlib-only local coding agent for macOS on Apple Silicon.
+> A single-file, stdlib-only local coding agent. Windows, Linux and macOS core;
+> optional macOS on Apple Silicon model launcher.
 
 ## Documentation
 
